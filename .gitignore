@@ -1,0 +1,15 @@
+node_modules/
+.env
+chains.json
+progress.md
+plan.md
+architecture.md
+research.md
+agent.md
+first-minters.txt
+*.db
+*.db-wal
+*.db-shm
+*.tgz
+logs/
+.DS_Store

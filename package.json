@@ -1,0 +1,21 @@
+{
+  "name": "nft-mint-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram alerts when tracked wallets mint NFTs (VPS edition)",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "selftest": "node bot.js --selftest",
+    "test-message": "node bot.js --test",
+    "backfill-once": "node bot.js --backfill-once"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.4",
+    "ethers": "^6.17.0"
+  }
+}
