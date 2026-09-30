@@ -100,7 +100,7 @@ git clone https://github.com/<you>/nft-mint-tracker.git ~/nft-tracker
 cd ~/nft-tracker && chmod 700 . && chmod 600 .env chains.json && ./deploy.sh
 ```
 
-`deploy.sh` installs Node 20 + PM2 if missing, installs deps, and starts the bot
+`deploy.sh` installs Node 22 + PM2 if missing, installs deps, and starts the bot
 under PM2. First time only: run `pm2 startup` and paste the printed sudo command
 so the bot survives reboots. Then `pm2 save`.
 
@@ -110,8 +110,8 @@ Check health from your phone: Telegram `/status` (reports each chain's cursor).
 
 | Task | How |
 |---|---|
-| Add a wallet | Telegram `/add 0x… [name]` or `/add name.eth [name]` — applied to **all** chains, live resubscribe |
-| Remove | `/remove 0x…` or `/remove name` |
+| Add a wallet | Telegram `/add 0x… [name]` or `/add name.eth [name]` — or send `/add` alone for a step-by-step prompt. Applied to **all** chains, live resubscribe |
+| Remove | `/remove 0x…` or `/remove name` (also step-by-step if sent alone) |
 | List / health | `/list`, `/status` · VPS logs: `pm2 logs nft-tracker` |
 | Restart after key/config change | edit `.env` or `chains.json`, then `pm2 restart nft-tracker --update-env` |
 | Add/remove a chain | edit `chains.json`, then `pm2 restart nft-tracker --update-env` |

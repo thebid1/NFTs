@@ -5,11 +5,16 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "==> checking node"
-if ! command -v node >/dev/null 2>&1 || [ "$(node -e 'console.log(process.versions.node.split(".")[0])')" -lt 20 ]; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+if ! command -v node >/dev/null 2>&1 || [ "$(node -e 'console.log(process.versions.node.split(".")[0])')" -lt 22 ]; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
   sudo apt install -y nodejs
 fi
 node --version
+
+echo "==> checking build tools (native modules need a compiler if no prebuilt binary downloads)"
+if ! command -v make >/dev/null 2>&1; then
+  sudo apt install -y build-essential
+fi
 
 echo "==> checking pm2"
 if ! command -v pm2 >/dev/null 2>&1; then

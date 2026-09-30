@@ -122,6 +122,7 @@ const q = {
   rmWallet: db.prepare("DELETE FROM wallets WHERE address=?"),
   cacheGet: db.prepare("SELECT value, expires_at FROM cache WHERE key=?"),
   cacheSet: db.prepare("INSERT INTO cache(key,value,expires_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at"),
+  cacheDel: db.prepare("DELETE FROM cache WHERE key=?"),
   addRetry: db.prepare("INSERT OR REPLACE INTO retry_queue VALUES (?,?,?)"),
   rmRetry: db.prepare("DELETE FROM retry_queue WHERE key=?"),
   pruneDedupe: db.prepare("DELETE FROM dedupe WHERE created_at<?"),
@@ -516,6 +517,37 @@ async function resolveEns(name) {
   try { return await httpFor("ethereum").resolveName(name); } catch { return null; }
 }
 
+// Shared /add logic: input = "0x… [label]" or "name.eth [label]".
+async function doAdd(reply, input) {
+  const parts = input.trim().split(/\s+/);
+  const arg = parts[0];
+  const label = parts.slice(1).join(" ").slice(0, 40) || null;
+  let addr = null;
+  if (/^0x[0-9a-fA-F]{40}$/.test(arg ?? "")) {
+    addr = arg.toLowerCase();
+  } else if (/^[^/\s]+\.eth$/i.test(arg ?? "")) {
+    addr = (await resolveEns(arg))?.toLowerCase() ?? null;
+    if (!addr) return reply(`❌ Couldn't resolve <code>${esc(arg)}</code> — check the spelling, or use a 0x address.`);
+  } else {
+    return reply("That doesn't look like a wallet — send <code>0x…</code> or <code>name.eth</code>.");
+  }
+  upsertWallet(addr, label);
+  await reply(`✅ Now tracking ${label ? `<b>${esc(label)}</b> ` : ""}<code>${addr}</code> on ${CHAINS.map(c => c.chain).join(", ")}`);
+  await restartAllDetectors(); // live resubscribe; cursor-protected backfill covers the gap
+}
+
+// Shared /remove logic: arg = address or exact label.
+async function doRemove(reply, arg) {
+  const rows = walletRows();
+  const byLabel = rows.find(r => r.label && r.label.toLowerCase() === arg.toLowerCase());
+  const addr = /^0x[0-9a-fA-F]{40}$/.test(arg) ? arg.toLowerCase() : byLabel?.address;
+  if (!addr) return reply("Not found — send an address or an exact label.");
+  const old = rows.find(r => r.address === addr);
+  q.rmWallet.run(addr);
+  await reply(`🗑 Removed ${old?.label ? `<b>${esc(old.label)}</b> ` : ""}<code>${addr}</code>`);
+  await restartAllDetectors();
+}
+
 async function handleCommand(m) {
   if (m.chat?.type !== "private") return;               // commands only via private chats, never the channel
   const chatId = String(m.chat.id);
@@ -529,33 +561,41 @@ async function handleCommand(m) {
     return;
   }
   const reply = text => tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
-  const parts = m.text.trim().split(/\s+/);
+  const text = m.text.trim();
+  const parts = text.split(/\s+/);
   const cmd = parts[0];
   const arg = parts[1];
-  const label = parts.slice(2).join(" ").slice(0, 40) || null;   // optional display name for /add
-  if (cmd === "/add" && arg) {
-    let addr = null;
-    if (/^0x[0-9a-fA-F]{40}$/.test(arg)) {
-      addr = arg.toLowerCase();
-    } else if (/^[^/\s]+\.eth$/i.test(arg)) {
-      addr = (await resolveEns(arg))?.toLowerCase() ?? null;
-      if (!addr) { await reply(`❌ Couldn't resolve <code>${esc(arg)}</code> — check the spelling, or use a 0x address.`); return; }
-    } else {
-      await reply("Usage: <code>/add 0x… [name]</code> or <code>/add name.eth [name]</code>"); return;
+
+  // Step-by-step mode: a pending prompt consumes this chat's next plain message.
+  const pendingKey = `pending:${chatId}`;
+  const pending = cacheGet(pendingKey);
+  if (pending && !text.startsWith("/")) {
+    q.cacheDel.run(pendingKey);
+    if (pending === "add") return doAdd(reply, text);
+    if (pending === "remove") return doRemove(reply, text);
+  }
+
+  if (cmd === "/cancel") {
+    q.cacheDel.run(pendingKey);
+    return reply("Cancelled.");
+  }
+  if (cmd === "/add") {
+    q.cacheDel.run(pendingKey);
+    if (!arg) {
+      cacheSet(pendingKey, "add", 5 * 60 * 1000);
+      return reply("Send the wallet to track — <code>0x…</code> or <code>name.eth</code>, optionally followed by a label.\nExample: <code>0x1234…abcd Whale1</code>. /cancel to abort.");
     }
-    upsertWallet(addr, label);
-    await reply(`✅ Now tracking ${label ? `<b>${esc(label)}</b> ` : ""}<code>${addr}</code> on ${CHAINS.map(c => c.chain).join(", ")}`);
-    await restartAllDetectors(); // live resubscribe; cursor-protected backfill covers the gap
-  } else if (cmd === "/remove" && arg) {
-    const rows = walletRows();
-    const byLabel = rows.find(r => r.label && r.label.toLowerCase() === arg.toLowerCase());
-    const addr = /^0x[0-9a-fA-F]{40}$/.test(arg) ? arg.toLowerCase() : byLabel?.address;
-    if (!addr) { await reply("Not found — <code>/remove</code> takes an address or an exact name."); return; }
-    const old = rows.find(r => r.address === addr);
-    q.rmWallet.run(addr);
-    await reply(`🗑 Removed ${old?.label ? `<b>${esc(old.label)}</b> ` : ""}<code>${addr}</code>`);
-    await restartAllDetectors();
-  } else if (cmd === "/allow" && /^-?\d+$/.test(arg ?? "")) {
+    return doAdd(reply, parts.slice(1).join(" "));
+  }
+  if (cmd === "/remove") {
+    q.cacheDel.run(pendingKey);
+    if (!arg) {
+      cacheSet(pendingKey, "remove", 5 * 60 * 1000);
+      return reply("Send the wallet to remove — <code>0x…</code> or its label. /cancel to abort.");
+    }
+    return doRemove(reply, arg);
+  }
+  if (cmd === "/allow" && /^-?\d+$/.test(arg ?? "")) {
     db.prepare("INSERT OR IGNORE INTO admins VALUES (?,?)").run(arg, Date.now());
     await reply(`✅ Granted admin to <code>${arg}</code>`);
   } else if (cmd === "/revoke" && /^-?\d+$/.test(arg ?? "")) {
@@ -573,7 +613,7 @@ async function handleCommand(m) {
     await notify(SAMPLE_INFO, "0x000000000000000000000000000000000000dEaD", "42", null, CHAINS[0]?.chain ?? "ethereum");
     await reply("✅ test message sent (check the alert destination too)");
   } else if (cmd === "/help") {
-    await reply("/add 0x… or name.eth [name] — track a wallet on all chains\n/remove 0x… or name — untrack\n/list — tracked wallets\n/status — health\n/test — sample alert\n/allow <id> — grant admin\n/revoke <id> — remove admin");
+    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name])\n/remove — untrack by address or label\n/list — tracked wallets\n/status — health\n/test — sample alert\n/allow <id> — grant admin (owner)\n/revoke <id> — remove admin (owner)\n/cancel — abort a pending prompt");
   }
 }
 
@@ -656,6 +696,21 @@ function selftest() {
 // ---------- entrypoints ----------
 async function main() {
   log(`mintbot starting · chains=${CHAINS.map(c => c.chain).join(",")} · lookback=${C.LOOKBACK_BLOCKS} · confirmations=${C.CONFIRMATIONS}`);
+  // Publish the command menu to Telegram (private chats) so / shows it even if BotFather edits lag.
+  tg("setMyCommands", {
+    commands: [
+      { command: "add", description: "Track a wallet: 0x… or name.eth, optional label" },
+      { command: "remove", description: "Untrack by address or label" },
+      { command: "list", description: "Show tracked wallets" },
+      { command: "status", description: "Bot health and chain cursors" },
+      { command: "test", description: "Send a sample alert" },
+      { command: "help", description: "Show all commands" },
+      { command: "allow", description: "Grant admin (owner only)" },
+      { command: "revoke", description: "Remove admin (owner only)" },
+      { command: "cancel", description: "Abort a pending prompt" },
+    ],
+    scope: { type: "all_private_chats" },
+  }).catch(e => log("setMyCommands:", e.message));
   flushRetries();
   prune();
   setInterval(prune, 24 * 3600 * 1000).unref();

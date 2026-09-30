@@ -11,7 +11,7 @@
     "backfill-once": "node bot.js --backfill-once"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
