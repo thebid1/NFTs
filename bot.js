@@ -714,8 +714,8 @@ async function main() {
   flushRetries();
   prune();
   setInterval(prune, 24 * 3600 * 1000).unref();
-  await restartAllDetectors();
-  commandLoop();
+  commandLoop();                                                 // Telegram answers immediately…
+  restartAllDetectors().catch(e => log("detectors:", e.message)); // …while backfills run in the background
 }
 
 if (MODE === "--selftest") {
