@@ -22,20 +22,28 @@ not in the repo.
 | Alchemy URLs per chain | alchemy.com → one free app **per chain** → copy its HTTPS, WSS, and NFT API URLs |
 | `OPENSEA_API_KEY` | `curl -X POST https://api.opensea.io/api/v2/auth/keys` (instant, free — rate-limited per IP; or a non-expiring key at opensea.io → Settings → Developer) |
 
-### 2. Channel streaming & multiple admins (optional)
+### 2. Multiple users (optional)
 
-- **Stream to a channel:** create your channel → Channel settings →
-  Administrators → add your bot (grant *Post Messages*). Then set
-  `TELEGRAM_CHAT_ID` to the channel: `@channelusername` for a public channel,
-  or the channel's `-100…` id for a private one — discover it by posting any
-  message in the channel (bot admin required) and running `node bot.js --chat-id`.
-- **Multiple admins:** (1) list private chat ids in `ADMIN_CHAT_IDS` in `.env`
+The bot is **multi-user**: everyone with access gets a private watchlist.
+
+- **Access:** (1) list private chat ids in `ADMIN_CHAT_IDS` in `.env`
   (comma-separated, needs a restart); or (2) **in-bot approval:** a friend
-  messages the bot and you get a "🙋 Access request" note — reply
-  `/allow <id>` from your private chat and they're an admin immediately.
-  `/revoke <id>` removes access.
-- Commands work from **private chats only** (never inside the channel), admins
-  only. The watchlist is shared by all admins.
+  messages the bot and you get a "🙋 Access request" note with their name and
+  id — reply `/allow <id>` from your private chat and they're in, no restart.
+  `/revoke <id>` removes access. Unknown users get an invite-only notice.
+- **Privacy:** each user's wallets, labels, and alerts are visible only to
+  them. `/list` and `/remove` touch only the caller's own wallets; the same
+  address can be tracked by several users independently and each gets their
+  own alert. Detection stays efficient: one shared on-chain subscription for
+  everyone.
+- Alerts are **DM'd to whoever tracks the wallet**. `TELEGRAM_CHAT_ID` = the
+  owner account — access requests and error notices go there.
+- **Channel mirror (optional, per user):** `/mirror @yourchannel` (or the
+  `-100…` id) also posts **your** alerts to that channel — handy to keep your
+  trackers in one place. The bot must be an admin in the channel (Post
+  Messages). `/mirror off` or `/unmirror` stops it; `/test` shows both
+  destinations. Each user mirrors only their own alerts to their own channel.
+- Commands work from private chats only, admins only.
 
 ### 3. Configure
 

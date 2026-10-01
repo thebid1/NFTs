@@ -109,17 +109,31 @@ const db = new Database(path.join(__dirname, "tracker.db"));
 db.pragma("journal_mode = WAL");
 db.exec(`CREATE TABLE IF NOT EXISTS dedupe(key TEXT PRIMARY KEY, created_at INTEGER);
          CREATE TABLE IF NOT EXISTS cursor(chain TEXT PRIMARY KEY, last_block INTEGER);
-         CREATE TABLE IF NOT EXISTS wallets(address TEXT PRIMARY KEY, added_at INTEGER);
+         CREATE TABLE IF NOT EXISTS wallets(address TEXT NOT NULL, added_at INTEGER, label TEXT, owner_chat_id TEXT, PRIMARY KEY(address, owner_chat_id));
          CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, value TEXT, expires_at INTEGER);
          CREATE TABLE IF NOT EXISTS retry_queue(key TEXT PRIMARY KEY, payload TEXT, run_at INTEGER);
          CREATE TABLE IF NOT EXISTS admins(chat_id TEXT PRIMARY KEY, added_at INTEGER);`);
+
+// migrations for DBs created before labels / per-user ownership existed —
+// MUST run before the prepared statements below reference the new columns.
+const walletsDdl = () => db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='wallets'").get()?.sql ?? "";
+if (!walletsDdl().includes("owner_chat_id")) {
+  db.exec("ALTER TABLE wallets ADD COLUMN owner_chat_id TEXT");
+  db.prepare("UPDATE wallets SET owner_chat_id=? WHERE owner_chat_id IS NULL").run(String(C.TELEGRAM_CHAT_ID));
+}
+if (!/PRIMARY KEY\s*\(\s*address\s*,\s*owner_chat_id\s*\)/i.test(walletsDdl())) {
+  // rebuild with composite PK so different users can each track the same address
+  db.exec(`CREATE TABLE wallets_new(address TEXT NOT NULL, added_at INTEGER, label TEXT, owner_chat_id TEXT, PRIMARY KEY(address, owner_chat_id));
+           INSERT INTO wallets_new SELECT address, added_at, label, owner_chat_id FROM wallets;
+           DROP TABLE wallets; ALTER TABLE wallets_new RENAME TO wallets;`);
+}
 
 const q = {
   seen: db.prepare("SELECT 1 FROM dedupe WHERE key=?"),
   addSeen: db.prepare("INSERT OR IGNORE INTO dedupe VALUES (?,?)"),
   getCursor: db.prepare("SELECT last_block FROM cursor WHERE chain=?"),
   setCursor: db.prepare("INSERT INTO cursor(chain,last_block) VALUES(?,?) ON CONFLICT(chain) DO UPDATE SET last_block=excluded.last_block"),
-  rmWallet: db.prepare("DELETE FROM wallets WHERE address=?"),
+  rmWallet: db.prepare("DELETE FROM wallets WHERE address=? AND owner_chat_id=?"),
   cacheGet: db.prepare("SELECT value, expires_at FROM cache WHERE key=?"),
   cacheSet: db.prepare("INSERT INTO cache(key,value,expires_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at"),
   cacheDel: db.prepare("DELETE FROM cache WHERE key=?"),
@@ -128,21 +142,20 @@ const q = {
   pruneDedupe: db.prepare("DELETE FROM dedupe WHERE created_at<?"),
 };
 
-// wallets.label migration for DBs created before named wallets existed
-if (!db.prepare("PRAGMA table_info(wallets)").all().some(c => c.name === "label")) {
-  db.exec("ALTER TABLE wallets ADD COLUMN label TEXT");
-}
-const walletRows = () => db.prepare("SELECT address, label FROM wallets ORDER BY added_at").all();
-const wallets = () => walletRows().map(r => r.address);
-const labelFor = addr => walletRows().find(r => r.address === addr)?.label ?? null;
-// Insert; a new label overwrites, omitting the label keeps any existing one.
-const upsertWallet = (addr, label) => db.prepare(
-  "INSERT INTO wallets(address,added_at,label) VALUES (?,?,?) " +
-  "ON CONFLICT(address) DO UPDATE SET label=COALESCE(excluded.label, wallets.label)"
-).run(addr, Date.now(), label);
+const walletRows = (owner = null) => owner == null
+  ? db.prepare("SELECT address, label, owner_chat_id FROM wallets ORDER BY added_at").all()
+  : db.prepare("SELECT address, label, owner_chat_id FROM wallets WHERE owner_chat_id=? ORDER BY added_at").all(owner);
+const wallets = () => [...new Set(walletRows().map(r => r.address))]; // union — one shared subscription set
+const labelFor = (addr, owner) => walletRows(owner).find(r => r.address === addr)?.label ?? null;
+const ownersOf = addr => [...new Set(walletRows().filter(r => r.address === addr).map(r => r.owner_chat_id))];
+// Insert per-user; a new label overwrites, omitting it keeps the existing one.
+const upsertWallet = (addr, label, owner) => db.prepare(
+  "INSERT INTO wallets(address,added_at,label,owner_chat_id) VALUES (?,?,?,?) " +
+  "ON CONFLICT(address,owner_chat_id) DO UPDATE SET label=COALESCE(excluded.label, wallets.label)"
+).run(addr, Date.now(), label, String(owner));
 
 if (!wallets().length && C.SEED_WALLET && /^0x[0-9a-fA-F]{40}$/.test(C.SEED_WALLET)) {
-  upsertWallet(C.SEED_WALLET.toLowerCase(), null);
+  upsertWallet(C.SEED_WALLET.toLowerCase(), null, C.TELEGRAM_CHAT_ID);
   log("seeded wallet", C.SEED_WALLET.toLowerCase());
 }
 const cacheGet = key => {
@@ -230,23 +243,23 @@ function replyMarkup(info, txHash, chain) {
   return { inline_keyboard: rows };
 }
 
-async function notify(info, wallet, tokenId, txHash, chain, label = null) {
+async function notify(info, wallet, tokenId, txHash, chain, label = null, chatId = C.TELEGRAM_CHAT_ID) {
   const text = render(info, wallet, tokenId, chain, label);
   const kb = replyMarkup(info, txHash, chain);
   if (info.imageUrl) {
     try {
-      await tg("sendPhoto", { chat_id: C.TELEGRAM_CHAT_ID, photo: info.imageUrl, caption: text, parse_mode: "HTML", reply_markup: kb });
+      await tg("sendPhoto", { chat_id: chatId, photo: info.imageUrl, caption: text, parse_mode: "HTML", reply_markup: kb });
       return;
     } catch (e) { log("sendPhoto failed, falling back to text:", e.message); }
   }
-  await tg("sendMessage", { chat_id: C.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: false, reply_markup: kb });
+  await tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: false, reply_markup: kb });
 }
 
-async function notifyWithRetry(info, wallet, tokenId, txHash, chain, label = null) {
+async function notifyWithRetry(info, wallet, tokenId, txHash, chain, label = null, chatId = C.TELEGRAM_CHAT_ID) {
   let last;
   for (const wait of [0, 2000, 8000]) {
     if (wait) await sleep(wait);
-    try { return await notify(info, wallet, tokenId, txHash, chain, label); } catch (e) { last = e; }
+    try { return await notify(info, wallet, tokenId, txHash, chain, label, chatId); } catch (e) { last = e; }
   }
   throw last;
 }
@@ -316,17 +329,23 @@ async function resolveSlug(chain, contract) {
 
 async function enrich(chain, contract, tokenId) {
   const cfg = chainCfg(chain);
-  const metaRaw = await j(`${cfg.nft}/getContractMetadata?contractAddress=${contract}`);
+  // Independent lookups fire in parallel — this is the alert-latency critical path.
+  const metaP = j(`${cfg.nft}/getContractMetadata?contractAddress=${contract}`);
+  const slugP = resolveSlug(chain, contract).catch(() => null);
+  const mintedP = readTotalSupply(chain, contract).catch(() => null);
+  const maxP = readMaxSupply(chain, contract).catch(() => null);
+
+  const metaRaw = await metaP;                     // throws → caller's retry-queue path
   const meta = metaRaw?.contractMetadata ?? metaRaw ?? {};
-  const slug = await resolveSlug(chain, contract).catch(() => null);
+  const slug = await slugP;
 
-  let stats = null;
-  if (slug) stats = await j(`https://api.opensea.io/api/v2/collections/${slug}/stats`, OS).catch(() => null);
-
-  let bestOffer = null;
+  let stats = null, bestOffer = null;
   if (slug) {
-    bestOffer = await j(`https://api.opensea.io/api/v2/offers/collection/${slug}`, OS)
-      .then(r => maxOffer(r.offers)).catch(() => null);
+    [stats, bestOffer] = await Promise.all([
+      j(`https://api.opensea.io/api/v2/collections/${slug}/stats`, OS).catch(() => null),
+      j(`https://api.opensea.io/api/v2/offers/collection/${slug}`, OS)
+        .then(r => maxOffer(r.offers)).catch(() => null),
+    ]);
     if (!bestOffer && tokenId != null) {
       bestOffer = await j(`https://api.opensea.io/api/v2/offers/collection/${slug}/nfts/${tokenId}/best`, OS)
         .then(b => b?.price ? `${Number(BigInt(b.price.value)) / 10 ** (b.price.decimals ?? 18)} ${b.price.currency ?? "ETH"}` : null)
@@ -334,9 +353,8 @@ async function enrich(chain, contract, tokenId) {
     }
   }
 
-  const onChainMinted = await readTotalSupply(chain, contract).catch(() => null);
+  const [onChainMinted, maxSupply] = await Promise.all([mintedP, maxP]);
   const minted = onChainMinted ?? (meta.totalSupply != null ? Number(meta.totalSupply) : (stats?.total?.total_supply ?? null));
-  const maxSupply = await readMaxSupply(chain, contract).catch(() => null);
   const name = meta.name ?? (slug ? slug : shortAddr(contract));
   const link = slug
     ? `https://opensea.io/collection/${slug}`
@@ -364,16 +382,16 @@ async function runRetry(key) {
   const pending = db.prepare("SELECT payload FROM retry_queue WHERE key=?").get(key);
   if (!pending) return;
   db.prepare("DELETE FROM retry_queue WHERE key=?").run(key);
-  const p = JSON.parse(pending.payload); // {chain, contract, tokenId, wallet, txHash, label}
+  const p = JSON.parse(pending.payload); // {chain, contract, tokenId, wallet, txHash, label, owner}
   try {
     const info = await enrich(p.chain, p.contract, p.tokenId);
-    await notifyWithRetry(info, p.wallet, p.tokenId, p.txHash, p.chain, p.label);
+    await deliver(info, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner);
     log("retry delivered full mint message", key);
   } catch {
-    await notifyWithRetry({
+    await deliver({
       name: shortAddr(p.contract), link: `https://opensea.io/assets/${p.chain}/${p.contract}`,
       maxSupply: null, minted: null, remaining: null, floor: null, bestOffer: null, imageUrl: null,
-    }, p.wallet, p.tokenId, p.txHash, p.chain, p.label).catch(e => log("degraded send failed:", e.message));
+    }, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner).catch(e => log("degraded send failed:", e.message));
     log("retry delivered degraded mint message", key);
   }
 }
@@ -387,27 +405,53 @@ function flushRetries() {
 }
 
 // ---------- mint pipeline ----------
+// Deliver to the owner's DM, plus their mirror channel if they set one (/mirror).
+async function deliver(info, wallet, tokenId, txHash, chain, label, owner) {
+  await notifyWithRetry(info, wallet, tokenId, txHash, chain, label, owner);
+  const mirror = cacheGet(`mirror:${owner}`);
+  if (mirror) {
+    await notifyWithRetry(info, wallet, tokenId, txHash, chain, label, mirror)
+      .catch(e => log("mirror send failed:", e.message));
+  }
+}
+
 async function processMint(chain, lg, parsed) {
-  const key = `${chain}:${lg.transactionHash}:${lg.index}`;
-  if (q.seen.get(key)) return;
-  q.addSeen.run(key, Date.now());
-  if (lg.blockNumber > 0) setCursorMax(chain, lg.blockNumber); // synthetic logs (replay) pass 0 — never let them move the cursor
   const { contract, tokenId, wallet } = parsed;
-  const label = labelFor(wallet);
-  let info;
-  try {
-    info = await enrich(chain, contract, tokenId);
-  } catch (e) {
-    log(`enrich failed for ${chain}:${contract}: ${e.message}; retry in 60s`);
-    scheduleRetry(key, { chain, contract, tokenId, wallet, txHash: lg.transactionHash, label }, 60_000);
+  // Whoever tracks this wallet gets their own alert; dedupe per recipient.
+  const owners = ownersOf(wallet);
+  if (!owners.length) return;
+  const fresh = [];
+  for (const owner of owners) {
+    const key = `${chain}:${lg.transactionHash}:${lg.index}:${owner}`;
+    if (q.seen.get(key)) continue;
+    q.addSeen.run(key, Date.now());
+    fresh.push(owner);
+  }
+  if (!fresh.length) {
+    if (lg.blockNumber > 0) setCursorMax(chain, lg.blockNumber); // synthetic logs (replay) pass 0 — never move the cursor
     return;
   }
+  if (lg.blockNumber > 0) setCursorMax(chain, lg.blockNumber);
+  let info;
   try {
-    await notifyWithRetry(info, wallet, tokenId, lg.transactionHash, chain, label);
-    log(`alert sent: [${chain}] ${info.name} -> ${label ?? shortAddr(wallet)} (block ${lg.blockNumber})`);
+    info = await enrich(chain, contract, tokenId); // enriched once, delivered to each owner
   } catch (e) {
-    log("NOTIFY FAILED PERMANENTLY:", e.message);
-    tg("sendMessage", { chat_id: ownerChat(), text: `⚠️ Mint alert for <code>${contract}</code> (${chain}) failed to send: ${esc(e.message)}`, parse_mode: "HTML" }).catch(() => {});
+    log(`enrich failed for ${chain}:${contract}: ${e.message}; retry in 60s`);
+    for (const owner of fresh) {
+      scheduleRetry(`${chain}:${lg.transactionHash}:${lg.index}:${owner}`,
+        { chain, contract, tokenId, wallet, txHash: lg.transactionHash, label: labelFor(wallet, owner), owner }, 60_000);
+    }
+    return;
+  }
+  for (const owner of fresh) {
+    const label = labelFor(wallet, owner);
+    try {
+      await deliver(info, wallet, tokenId, lg.transactionHash, chain, label, owner);
+      log(`alert sent: [${chain}] ${info.name} -> ${label ?? shortAddr(wallet)} (block ${lg.blockNumber}${cacheGet(`mirror:${owner}`) ? " +mirror" : ""})`);
+    } catch (e) {
+      log("NOTIFY FAILED PERMANENTLY:", e.message);
+      tg("sendMessage", { chat_id: ownerChat(), text: `⚠️ Mint alert for <code>${contract}</code> (${chain}) failed to reach <code>${owner}</code>: ${esc(e.message)}`, parse_mode: "HTML" }).catch(() => {});
+    }
   }
 }
 
@@ -517,8 +561,8 @@ async function resolveEns(name) {
   try { return await httpFor("ethereum").resolveName(name); } catch { return null; }
 }
 
-// Shared /add logic: input = "0x… [label]" or "name.eth [label]".
-async function doAdd(reply, input) {
+// Shared /add logic: input = "0x… [label]" or "name.eth [label]". Wallet belongs to `owner`.
+async function doAdd(reply, input, owner) {
   const parts = input.trim().split(/\s+/);
   const arg = parts[0];
   const label = parts.slice(1).join(" ").slice(0, 40) || null;
@@ -531,21 +575,33 @@ async function doAdd(reply, input) {
   } else {
     return reply("That doesn't look like a wallet — send <code>0x…</code> or <code>name.eth</code>.");
   }
-  upsertWallet(addr, label);
-  await reply(`✅ Now tracking ${label ? `<b>${esc(label)}</b> ` : ""}<code>${addr}</code> on ${CHAINS.map(c => c.chain).join(", ")}`);
+  upsertWallet(addr, label, owner);
+  await reply(`✅ Now tracking ${label ? `<b>${esc(label)}</b> ` : ""}<code>${addr}</code> on ${CHAINS.map(c => c.chain).join(", ")} — alerts will come to you here, privately.`);
   await restartAllDetectors(); // live resubscribe; cursor-protected backfill covers the gap
 }
 
-// Shared /remove logic: arg = address or exact label.
-async function doRemove(reply, arg) {
-  const rows = walletRows();
+// Shared /remove logic: arg = address or exact label, scoped to the caller's own wallets.
+async function doRemove(reply, arg, owner) {
+  const rows = walletRows(owner);
   const byLabel = rows.find(r => r.label && r.label.toLowerCase() === arg.toLowerCase());
   const addr = /^0x[0-9a-fA-F]{40}$/.test(arg) ? arg.toLowerCase() : byLabel?.address;
-  if (!addr) return reply("Not found — send an address or an exact label.");
-  const old = rows.find(r => r.address === addr);
-  q.rmWallet.run(addr);
-  await reply(`🗑 Removed ${old?.label ? `<b>${esc(old.label)}</b> ` : ""}<code>${addr}</code>`);
+  if (!addr) return reply("Not found — send an address or an exact label from YOUR list (/list).");
+  q.rmWallet.run(addr, String(owner));
+  await reply(`🗑 Removed ${byLabel?.label ? `<b>${esc(byLabel.label)}</b> ` : ""}<code>${addr}</code>`);
   await restartAllDetectors();
+}
+
+// /mirror logic: v = "@channel", "-100…", or "off". Mirrors only affect the caller's own alerts.
+async function doMirror(reply, v, owner) {
+  if (v.toLowerCase() === "off") {
+    q.cacheDel.run(`mirror:${owner}`);
+    return reply("🔕 Channel mirroring off — your alerts come to this chat only.");
+  }
+  if (!/^@\w{4,}$|^-100\d+$/.test(v)) {
+    return reply("Send the channel as <code>@channelusername</code> or its <code>-100…</code> id, or \"off\" to disable.");
+  }
+  cacheSet(`mirror:${owner}`, v, null);
+  await reply(`📣 Your alerts will also post to <code>${esc(v)}</code> — make sure the bot is an admin there (Post Messages). Check with <code>/test</code>. /unmirror or <code>/mirror off</code> to stop.`);
 }
 
 async function handleCommand(m) {
@@ -571,13 +627,26 @@ async function handleCommand(m) {
   const pending = cacheGet(pendingKey);
   if (pending && !text.startsWith("/")) {
     q.cacheDel.run(pendingKey);
-    if (pending === "add") return doAdd(reply, text);
-    if (pending === "remove") return doRemove(reply, text);
+    if (pending === "add") return doAdd(reply, text, chatId);
+    if (pending === "remove") return doRemove(reply, text, chatId);
+    if (pending === "mirror") return doMirror(reply, text, chatId);
   }
 
   if (cmd === "/cancel") {
     q.cacheDel.run(pendingKey);
     return reply("Cancelled.");
+  }
+  if (cmd === "/mirror") {
+    q.cacheDel.run(pendingKey);
+    if (!arg) {
+      cacheSet(pendingKey, "mirror", 5 * 60 * 1000);
+      return reply("Send the channel where YOUR alerts should also post: <code>@channelusername</code> or its <code>-100…</code> id (bot must be admin there). Send \"off\" to disable. /cancel to abort.");
+    }
+    return doMirror(reply, parts.slice(1).join(" "), chatId);
+  }
+  if (cmd === "/unmirror") {
+    q.cacheDel.run(pendingKey);
+    return doMirror(reply, "off", chatId);
   }
   if (cmd === "/add") {
     q.cacheDel.run(pendingKey);
@@ -585,7 +654,7 @@ async function handleCommand(m) {
       cacheSet(pendingKey, "add", 5 * 60 * 1000);
       return reply("Send the wallet to track — <code>0x…</code> or <code>name.eth</code>, optionally followed by a label.\nExample: <code>0x1234…abcd Whale1</code>. /cancel to abort.");
     }
-    return doAdd(reply, parts.slice(1).join(" "));
+    return doAdd(reply, parts.slice(1).join(" "), chatId);
   }
   if (cmd === "/remove") {
     q.cacheDel.run(pendingKey);
@@ -593,7 +662,7 @@ async function handleCommand(m) {
       cacheSet(pendingKey, "remove", 5 * 60 * 1000);
       return reply("Send the wallet to remove — <code>0x…</code> or its label. /cancel to abort.");
     }
-    return doRemove(reply, arg);
+    return doRemove(reply, arg, chatId);
   }
   if (cmd === "/allow" && /^-?\d+$/.test(arg ?? "")) {
     db.prepare("INSERT OR IGNORE INTO admins VALUES (?,?)").run(arg, Date.now());
@@ -602,7 +671,7 @@ async function handleCommand(m) {
     db.prepare("DELETE FROM admins WHERE chat_id=?").run(arg);
     await reply(`🗑 Revoked admin <code>${arg}</code>`);
   } else if (cmd === "/list") {
-    await reply("👛 Tracked wallets:\n" + (walletRows().map(r => `${r.label ? `<b>${esc(r.label)}</b> — ` : ""}<code>${r.address}</code>`).join("\n") || "(none)"));
+    await reply("👛 Your wallets:\n" + (walletRows(chatId).map(r => `${r.label ? `<b>${esc(r.label)}</b> — ` : ""}<code>${r.address}</code>`).join("\n") || "(none)"));
   } else if (cmd === "/status") {
     const perChain = CHAINS.map(c => {
       const live = detectors.get(c.chain)?.provider ? "live" : "idle";
@@ -610,10 +679,10 @@ async function handleCommand(m) {
     }).join("\n");
     await reply(`⚙️ up ${Math.floor(process.uptime())}s · ${wallets().length} wallet(s)\n${perChain}`);
   } else if (cmd === "/test") {
-    await notify(SAMPLE_INFO, "0x000000000000000000000000000000000000dEaD", "42", null, CHAINS[0]?.chain ?? "ethereum");
-    await reply("✅ test message sent (check the alert destination too)");
+    await deliver(SAMPLE_INFO, "0x000000000000000000000000000000000000dEaD", "42", null, CHAINS[0]?.chain ?? "ethereum", "Sample Wallet", chatId);
+    await reply("✅ sample sent — check your DM and your mirror channel");
   } else if (cmd === "/help") {
-    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name])\n/remove — untrack by address or label\n/list — tracked wallets\n/status — health\n/test — sample alert\n/allow <id> — grant admin (owner)\n/revoke <id> — remove admin (owner)\n/cancel — abort a pending prompt");
+    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name])\n/remove — untrack by address or label\n/list — your wallets\n/status — health\n/test — sample alert to you (+ your mirror channel)\n/mirror @channel — also post YOUR alerts to a channel (bot admin there; \"/mirror off\" to stop)\n/allow <id> — grant admin (owner)\n/revoke <id> — remove admin (owner)\n/cancel — abort a pending prompt");
   }
 }
 
@@ -707,6 +776,8 @@ async function main() {
       { command: "help", description: "Show all commands" },
       { command: "allow", description: "Grant admin (owner only)" },
       { command: "revoke", description: "Remove admin (owner only)" },
+      { command: "mirror", description: "Also post YOUR alerts to a channel: /mirror @channel (or off)" },
+      { command: "unmirror", description: "Stop channel mirroring" },
       { command: "cancel", description: "Abort a pending prompt" },
     ],
     scope: { type: "all_private_chats" },
