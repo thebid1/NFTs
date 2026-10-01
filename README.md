@@ -38,11 +38,13 @@ The bot is **multi-user**: everyone with access gets a private watchlist.
   everyone.
 - Alerts are **DM'd to whoever tracks the wallet**. `TELEGRAM_CHAT_ID` = the
   owner account — access requests and error notices go there.
-- **Channel mirror (optional, per user):** `/mirror @yourchannel` (or the
-  `-100…` id) also posts **your** alerts to that channel — handy to keep your
-  trackers in one place. The bot must be an admin in the channel (Post
-  Messages). `/mirror off` or `/unmirror` stops it; `/test` shows both
-  destinations. Each user mirrors only their own alerts to their own channel.
+- **Channels are independent workspaces (not mirrors):** add the bot to any
+  channel (as admin) and run `/add` right there — that channel gets its OWN
+  watchlist and its alerts post in the channel. Only channel admins can manage
+  a channel's list (verified via getChatAdministrators, cached 5 min);
+  anonymous "post as channel" counts as admin. A channel's wallets are
+  separate from every user's DM watchlist. `/allow`/`/revoke` remain
+  private-chat owner functions.
 - Commands work from private chats only, admins only.
 
 ### 3. Configure

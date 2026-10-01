@@ -385,10 +385,10 @@ async function runRetry(key) {
   const p = JSON.parse(pending.payload); // {chain, contract, tokenId, wallet, txHash, label, owner}
   try {
     const info = await enrich(p.chain, p.contract, p.tokenId);
-    await deliver(info, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner);
+    await notifyWithRetry(info, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner);
     log("retry delivered full mint message", key);
   } catch {
-    await deliver({
+    await notifyWithRetry({
       name: shortAddr(p.contract), link: `https://opensea.io/assets/${p.chain}/${p.contract}`,
       maxSupply: null, minted: null, remaining: null, floor: null, bestOffer: null, imageUrl: null,
     }, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner).catch(e => log("degraded send failed:", e.message));
@@ -405,16 +405,6 @@ function flushRetries() {
 }
 
 // ---------- mint pipeline ----------
-// Deliver to the owner's DM, plus their mirror channel if they set one (/mirror).
-async function deliver(info, wallet, tokenId, txHash, chain, label, owner) {
-  await notifyWithRetry(info, wallet, tokenId, txHash, chain, label, owner);
-  const mirror = cacheGet(`mirror:${owner}`);
-  if (mirror) {
-    await notifyWithRetry(info, wallet, tokenId, txHash, chain, label, mirror)
-      .catch(e => log("mirror send failed:", e.message));
-  }
-}
-
 async function processMint(chain, lg, parsed) {
   const { contract, tokenId, wallet } = parsed;
   // Whoever tracks this wallet gets their own alert; dedupe per recipient.
@@ -446,8 +436,8 @@ async function processMint(chain, lg, parsed) {
   for (const owner of fresh) {
     const label = labelFor(wallet, owner);
     try {
-      await deliver(info, wallet, tokenId, lg.transactionHash, chain, label, owner);
-      log(`alert sent: [${chain}] ${info.name} -> ${label ?? shortAddr(wallet)} (block ${lg.blockNumber}${cacheGet(`mirror:${owner}`) ? " +mirror" : ""})`);
+      await notifyWithRetry(info, wallet, tokenId, lg.transactionHash, chain, label, owner);
+      log(`alert sent: [${chain}] ${info.name} -> ${label ?? shortAddr(wallet)} (block ${lg.blockNumber})`);
     } catch (e) {
       log("NOTIFY FAILED PERMANENTLY:", e.message);
       tg("sendMessage", { chat_id: ownerChat(), text: `⚠️ Mint alert for <code>${contract}</code> (${chain}) failed to reach <code>${owner}</code>: ${esc(e.message)}`, parse_mode: "HTML" }).catch(() => {});
@@ -591,30 +581,40 @@ async function doRemove(reply, arg, owner) {
   await restartAllDetectors();
 }
 
-// /mirror logic: v = "@channel", "-100…", or "off". Mirrors only affect the caller's own alerts.
-async function doMirror(reply, v, owner) {
-  if (v.toLowerCase() === "off") {
-    q.cacheDel.run(`mirror:${owner}`);
-    return reply("🔕 Channel mirroring off — your alerts come to this chat only.");
-  }
-  if (!/^@\w{4,}$|^-100\d+$/.test(v)) {
-    return reply("Send the channel as <code>@channelusername</code> or its <code>-100…</code> id, or \"off\" to disable.");
-  }
-  cacheSet(`mirror:${owner}`, v, null);
-  await reply(`📣 Your alerts will also post to <code>${esc(v)}</code> — make sure the bot is an admin there (Post Messages). Check with <code>/test</code>. /unmirror or <code>/mirror off</code> to stop.`);
+// Channels are independent tenants: commands are accepted from channel ADMINS only,
+// and wallets added there belong to the channel (alerts post in the channel).
+const channelAdminCache = new Map(); // chatId -> { ids: Set<userId>, ts }
+async function isChannelAdmin(m) {
+  const chatId = String(m.chat.id);
+  if (m.sender_chat && String(m.sender_chat.id) === chatId) return true; // posted as the channel itself
+  if (!m.from?.id) return false;
+  const hit = channelAdminCache.get(chatId);
+  if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.ids.has(m.from.id);
+  try {
+    const r = await tg("getChatAdministrators", { chat_id: chatId });
+    const ids = new Set((r.result ?? []).map(a => a.user?.id).filter(Boolean));
+    channelAdminCache.set(chatId, { ids, ts: Date.now() });
+    return ids.has(m.from.id);
+  } catch { return false; }
 }
 
 async function handleCommand(m) {
-  if (m.chat?.type !== "private") return;               // commands only via private chats, never the channel
   const chatId = String(m.chat.id);
-  if (!adminIds().includes(chatId)) {                   // unknown user: invite-only notice + one access request to the owner
-    if (!cacheGet(`req:${chatId}`)) {
-      cacheSet(`req:${chatId}`, "1", 30 * 24 * 3600 * 1000);
-      const who = [m.from?.first_name, m.from?.username ? `@${m.from.username}` : null].filter(Boolean).join(" ");
-      tg("sendMessage", { chat_id: ownerChat(), text: `🙋 Access request: ${who || "unknown user"}, chat id <code>${chatId}</code> — reply <code>/allow ${chatId}</code> to grant.`, parse_mode: "HTML" }).catch(() => {});
+  const isPrivate = m.chat?.type === "private";
+  if (isPrivate) {
+    if (!adminIds().includes(chatId)) {                 // unknown user: invite-only notice + one access request to the owner
+      if (!cacheGet(`req:${chatId}`)) {
+        cacheSet(`req:${chatId}`, "1", 30 * 24 * 3600 * 1000);
+        const who = [m.from?.first_name, m.from?.username ? `@${m.from.username}` : null].filter(Boolean).join(" ");
+        tg("sendMessage", { chat_id: ownerChat(), text: `🙋 Access request: ${who || "unknown user"}, chat id <code>${chatId}</code> — reply <code>/allow ${chatId}</code> to grant.`, parse_mode: "HTML" }).catch(() => {});
+      }
+      await tg("sendMessage", { chat_id: chatId, text: "⛔ This bot is invite-only — the owner has been notified of your request." }).catch(() => {});
+      return;
     }
-    await tg("sendMessage", { chat_id: chatId, text: "⛔ This bot is invite-only — the owner has been notified of your request." }).catch(() => {});
-    return;
+  } else if (m.chat?.type === "channel") {
+    if (!(await isChannelAdmin(m))) return;             // only channel admins manage the channel's watchlist
+  } else {
+    return;                                             // groups/supergroups not supported
   }
   const reply = text => tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
   const text = m.text.trim();
@@ -629,24 +629,11 @@ async function handleCommand(m) {
     q.cacheDel.run(pendingKey);
     if (pending === "add") return doAdd(reply, text, chatId);
     if (pending === "remove") return doRemove(reply, text, chatId);
-    if (pending === "mirror") return doMirror(reply, text, chatId);
   }
 
   if (cmd === "/cancel") {
     q.cacheDel.run(pendingKey);
     return reply("Cancelled.");
-  }
-  if (cmd === "/mirror") {
-    q.cacheDel.run(pendingKey);
-    if (!arg) {
-      cacheSet(pendingKey, "mirror", 5 * 60 * 1000);
-      return reply("Send the channel where YOUR alerts should also post: <code>@channelusername</code> or its <code>-100…</code> id (bot must be admin there). Send \"off\" to disable. /cancel to abort.");
-    }
-    return doMirror(reply, parts.slice(1).join(" "), chatId);
-  }
-  if (cmd === "/unmirror") {
-    q.cacheDel.run(pendingKey);
-    return doMirror(reply, "off", chatId);
   }
   if (cmd === "/add") {
     q.cacheDel.run(pendingKey);
@@ -664,10 +651,10 @@ async function handleCommand(m) {
     }
     return doRemove(reply, arg, chatId);
   }
-  if (cmd === "/allow" && /^-?\d+$/.test(arg ?? "")) {
+  if (cmd === "/allow" && isPrivate && /^-?\d+$/.test(arg ?? "")) {
     db.prepare("INSERT OR IGNORE INTO admins VALUES (?,?)").run(arg, Date.now());
     await reply(`✅ Granted admin to <code>${arg}</code>`);
-  } else if (cmd === "/revoke" && /^-?\d+$/.test(arg ?? "")) {
+  } else if (cmd === "/revoke" && isPrivate && /^-?\d+$/.test(arg ?? "")) {
     db.prepare("DELETE FROM admins WHERE chat_id=?").run(arg);
     await reply(`🗑 Revoked admin <code>${arg}</code>`);
   } else if (cmd === "/list") {
@@ -679,10 +666,10 @@ async function handleCommand(m) {
     }).join("\n");
     await reply(`⚙️ up ${Math.floor(process.uptime())}s · ${wallets().length} wallet(s)\n${perChain}`);
   } else if (cmd === "/test") {
-    await deliver(SAMPLE_INFO, "0x000000000000000000000000000000000000dEaD", "42", null, CHAINS[0]?.chain ?? "ethereum", "Sample Wallet", chatId);
-    await reply("✅ sample sent — check your DM and your mirror channel");
+    await notify(SAMPLE_INFO, "0x000000000000000000000000000000000000dEaD", "42", null, CHAINS[0]?.chain ?? "ethereum", "Sample Wallet", chatId);
+    await reply("✅ sample sent here");
   } else if (cmd === "/help") {
-    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name])\n/remove — untrack by address or label\n/list — your wallets\n/status — health\n/test — sample alert to you (+ your mirror channel)\n/mirror @channel — also post YOUR alerts to a channel (bot admin there; \"/mirror off\" to stop)\n/allow <id> — grant admin (owner)\n/revoke <id> — remove admin (owner)\n/cancel — abort a pending prompt");
+    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name])\n/remove — untrack by address or label\n/list — this chat's wallets\n/status — health\n/test — sample alert to this chat\n/allow <id> — grant bot access (owner, private chat)\n/revoke <id> — remove access (owner, private chat)\n/cancel — abort a pending prompt\nIn a channel: channel admins manage that channel's own watchlist — everything stays in the channel.");
   }
 }
 
@@ -774,10 +761,8 @@ async function main() {
       { command: "status", description: "Bot health and chain cursors" },
       { command: "test", description: "Send a sample alert" },
       { command: "help", description: "Show all commands" },
-      { command: "allow", description: "Grant admin (owner only)" },
-      { command: "revoke", description: "Remove admin (owner only)" },
-      { command: "mirror", description: "Also post YOUR alerts to a channel: /mirror @channel (or off)" },
-      { command: "unmirror", description: "Stop channel mirroring" },
+      { command: "allow", description: "Grant admin (owner only, private chat)" },
+      { command: "revoke", description: "Remove admin (owner only, private chat)" },
       { command: "cancel", description: "Abort a pending prompt" },
     ],
     scope: { type: "all_private_chats" },
