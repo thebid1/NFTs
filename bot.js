@@ -598,9 +598,11 @@ async function isChannelAdmin(m) {
   } catch { return false; }
 }
 
-async function handleCommand(m) {
+// Shared gate for commands AND file uploads: private admins, or channel admins in channels.
+async function authorize(m) {
   const chatId = String(m.chat.id);
   const isPrivate = m.chat?.type === "private";
+  const reply = text => tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
   if (isPrivate) {
     if (!adminIds().includes(chatId)) {                 // unknown user: invite-only notice + one access request to the owner
       if (!cacheGet(`req:${chatId}`)) {
@@ -608,15 +610,22 @@ async function handleCommand(m) {
         const who = [m.from?.first_name, m.from?.username ? `@${m.from.username}` : null].filter(Boolean).join(" ");
         tg("sendMessage", { chat_id: ownerChat(), text: `🙋 Access request: ${who || "unknown user"}, chat id <code>${chatId}</code> — reply <code>/allow ${chatId}</code> to grant.`, parse_mode: "HTML" }).catch(() => {});
       }
-      await tg("sendMessage", { chat_id: chatId, text: "⛔ This bot is invite-only — the owner has been notified of your request." }).catch(() => {});
-      return;
+      await reply("⛔ This bot is invite-only — the owner has been notified of your request.").catch(() => {});
+      return { ok: false };
     }
-  } else if (m.chat?.type === "channel") {
-    if (!(await isChannelAdmin(m))) return;             // only channel admins manage the channel's watchlist
-  } else {
-    return;                                             // groups/supergroups not supported
+    return { ok: true, chatId, isPrivate, reply };
   }
-  const reply = text => tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+  if (m.chat?.type === "channel") {
+    if (await isChannelAdmin(m)) return { ok: true, chatId, isPrivate, reply }; // only channel admins manage the channel's watchlist
+    return { ok: false };
+  }
+  return { ok: false };                                 // groups/supergroups not supported
+}
+
+async function handleCommand(m) {
+  const auth = await authorize(m);
+  if (!auth.ok) return;
+  const { chatId, isPrivate, reply } = auth;
   const text = m.text.trim();
   const parts = text.split(/\s+/);
   const cmd = parts[0];
@@ -669,8 +678,55 @@ async function handleCommand(m) {
     await notify(SAMPLE_INFO, "0x000000000000000000000000000000000000dEaD", "42", null, CHAINS[0]?.chain ?? "ethereum", "Sample Wallet", chatId);
     await reply("✅ sample sent here");
   } else if (cmd === "/help") {
-    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name])\n/remove — untrack by address or label\n/list — this chat's wallets\n/status — health\n/test — sample alert to this chat\n/allow <id> — grant bot access (owner, private chat)\n/revoke <id> — remove access (owner, private chat)\n/cancel — abort a pending prompt\nIn a channel: channel admins manage that channel's own watchlist — everything stays in the channel.");
+    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name]); bulk: send a .txt/.csv file — one wallet per line, optional label\n/remove — untrack by address or label\n/list — this chat's wallets\n/status — health\n/test — sample alert to this chat\n/allow <id> — grant bot access (owner, private chat)\n/revoke <id> — remove access (owner, private chat)\n/cancel — abort a pending prompt\nIn a channel: channel admins manage that channel's own watchlist — everything stays in the channel.");
   }
+}
+
+const BULK_MAX_ROWS = 1000;
+const BULK_MAX_BYTES = 200 * 1024;
+
+// Bulk import: send a .txt/.csv with one wallet per line — "0x… [label]", "name.eth [label]", or CSV "0x…,label".
+async function handleDocument(m) {
+  const auth = await authorize(m);
+  if (!auth.ok) return;
+  const { chatId, reply } = auth;
+  const doc = m.document;
+  const fileName = doc.file_name ?? "";
+  const mime = doc.mime_type ?? "";
+  if (!/\.(txt|csv)$/i.test(fileName) && !mime.startsWith("text/")) {
+    return reply("📄 Send a <code>.txt</code> or <code>.csv</code> file — one wallet per line, optional label (<code>0x… Whale1</code> or <code>0x…,Whale1</code>).");
+  }
+  if ((doc.file_size ?? 0) > BULK_MAX_BYTES) return reply("File too large — max 200 KB.");
+  const f = await tg("getFile", { file_id: doc.file_id });
+  const r = await fetch(`https://api.telegram.org/file/bot${C.TELEGRAM_BOT_TOKEN}/${f.result.file_path}`);
+  if (!r.ok) return reply("Couldn't download the file — try again.");
+  const lines = (await r.text()).split(/\r?\n/)
+    .map(l => l.trim())
+    .filter((l, i) => l && !l.startsWith("#") && !(i === 0 && /^address\b/i.test(l))); // skip blanks, comments, CSV header
+  if (!lines.length) return reply("No wallets found in that file.");
+  if (lines.length > BULK_MAX_ROWS) return reply(`Too many rows (${lines.length}) — max ${BULK_MAX_ROWS} per file.`);
+  await reply(`⏳ Importing ${lines.length} wallets…`);
+  let added = 0, updated = 0, bad = 0;
+  const badSample = [];
+  for (const line of lines) {
+    const parts = line.includes(",") ? line.split(",").map(s => s.trim()) : line.split(/\s+/);
+    const arg = parts[0];
+    const label = parts.slice(1).join(" ").slice(0, 40) || null;
+    let addr = null;
+    if (/^0x[0-9a-fA-F]{40}$/.test(arg)) addr = arg.toLowerCase();
+    else if (/^[^/\s]+\.eth$/i.test(arg)) addr = (await resolveEns(arg))?.toLowerCase() ?? null;
+    if (!addr) {
+      bad++;
+      if (badSample.length < 5) badSample.push(line.slice(0, 50));
+      continue;
+    }
+    const exists = walletRows(chatId).some(w => w.address === addr);
+    upsertWallet(addr, label, chatId);
+    if (exists) updated++; else added++;
+  }
+  await restartAllDetectors();
+  await reply(`✅ Import done: <b>${added}</b> added, <b>${updated}</b> already tracked (labels updated), <b>${bad}</b> skipped` +
+    (badSample.length ? `.\nSkipped examples:\n<code>${badSample.map(esc).join("\n")}</code>` : "."));
 }
 
 async function commandLoop() {
@@ -683,6 +739,7 @@ async function commandLoop() {
         cacheSet("tg_offset", String(offset), null);
         const m = u.message ?? u.edited_message;
         if (m?.text) await handleCommand(m).catch(e => log("command failed:", e.message));
+        else if (m?.document) await handleDocument(m).catch(e => log("document failed:", e.message));
       }
     } catch (e) { log("getUpdates:", e.message); await sleep(5000); }
   }

@@ -120,7 +120,7 @@ Check health from your phone: Telegram `/status` (reports each chain's cursor).
 
 | Task | How |
 |---|---|
-| Add a wallet | Telegram `/add 0x… [name]` or `/add name.eth [name]` — or send `/add` alone for a step-by-step prompt. Applied to **all** chains, live resubscribe |
+| Add a wallet | Telegram `/add 0x… [name]` or `/add name.eth [name]` — or send `/add` alone for a step-by-step prompt. **Bulk:** send a `.txt`/`.csv` file (one wallet per line, optional label — space or comma separated; `#` comments and a header row are ignored; max 1,000 rows). Applied to **all** chains, live resubscribe |
 | Remove | `/remove 0x…` or `/remove name` (also step-by-step if sent alone) |
 | List / health | `/list`, `/status` · VPS logs: `pm2 logs nft-tracker` |
 | Restart after key/config change | edit `.env` or `chains.json`, then `pm2 restart nft-tracker --update-env` |
