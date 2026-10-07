@@ -96,6 +96,7 @@ function loadChains() {
 const C = loadConfig();
 const CHAINS = loadChains();
 const chainCfg = name => CHAINS.find(c => c.chain === name);
+const urlList = v => (v == null ? [] : Array.isArray(v) ? v : [v]).filter(Boolean);
 // Admins: env bootstrap list ∪ runtime /allow list (persisted in SQLite).
 // Defaults to the alert destination if neither is configured.
 const dbAdmins = () => db.prepare("SELECT chat_id FROM admins").all().map(r => r.chat_id);
@@ -288,7 +289,13 @@ function httpFor(chain) {
   if (!httpProviders.has(chain)) {
     const cfg = chainCfg(chain);
     if (!cfg) throw new Error(`unknown chain: ${chain}`);
-    httpProviders.set(chain, new ethers.JsonRpcProvider(cfg.https, undefined, { timeout: 60000 }));
+    const urls = urlList(cfg.https);
+    if (!urls.length) throw new Error(`no https endpoints for chain: ${chain}`);
+    const ranked = urls.map((u, i) => ({
+      provider: new ethers.JsonRpcProvider(u, undefined, { timeout: 60000 }),
+      priority: i, // array order = try order; cheap/free first, metered providers last
+    }));
+    httpProviders.set(chain, ranked.length === 1 ? ranked[0].provider : new ethers.FallbackProvider(ranked, 1));
   }
   return httpProviders.get(chain);
 }
@@ -472,6 +479,7 @@ const enqueue = fn => { pipeline = pipeline.then(fn).catch(e => log("pipeline:",
 
 // ---------- detectors: one websocket subscription set per chain ----------
 const detectors = new Map(); // chain -> {provider, stopped, gen, restartTimer, watchdog}
+const wssCursor = new Map(); // chain -> rotation index over the chain's wss URL list
 
 function stopDetector(chain) {
   const d = detectors.get(chain);
@@ -490,6 +498,7 @@ function scheduleReconnect(chain, gen) {
   if (!d || d.stopped || d.gen !== gen || d.restartTimer) return;
   const n = (reconnectFails.get(chain) ?? 0) + 1;
   reconnectFails.set(chain, n);
+  wssCursor.set(chain, (wssCursor.get(chain) ?? 0) + 1);
   const delay = Math.min(60_000, 5_000 * 2 ** (n - 1)); // 5s → 10s → 20s → 40s → 60s cap
   d.restartTimer = setTimeout(async () => {
     d.restartTimer = null;
@@ -508,7 +517,10 @@ async function startDetector(chain) {
   const filters = buildFilters();
   if (!filters.length) { log("no tracked wallets; detectors idle — use /add to start tracking"); return; }
 
-  const wss = new ethers.WebSocketProvider(cfg.wss);
+  const wssUrls = urlList(cfg.wss);
+  if (!wssUrls.length) { log(`[${chain}] no wss endpoints; skipping`); return; }
+  const wssUrl = wssUrls[(wssCursor.get(chain) ?? 0) % wssUrls.length];
+  const wss = new ethers.WebSocketProvider(wssUrl);
   d.provider = wss;
   const onWsDown = why => { log(`[${chain}] websocket down (${why}); reconnecting in 5s`); scheduleReconnect(chain, gen); };
   wss.on("error", e => onWsDown(e?.message ?? "error"));
@@ -524,7 +536,7 @@ async function startDetector(chain) {
 
   for (const f of filters) wss.on({ topics: f.topics }, entry => enqueue(() => handleLog(chain, entry)));
   reconnectFails.set(chain, 0);
-  log(`[${chain}] subscribed (${filters.map(f => f.label).join("+")}) to ${wallets().length} wallet(s)`);
+  log(`[${chain}] subscribed via ${wssUrl.replace(/(g\.alchemy\.com\/v2\/)\w+/, "$1…")} (${filters.map(f => f.label).join("+")}) on ${wallets().length} wallet(s)`);
 
   // liveness probe: catches half-dead sockets that never emit close.
   // net_version is 0 CU on Alchemy; eth_blockNumber is 10 CU per call.

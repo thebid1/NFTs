@@ -1,22 +1,53 @@
 [
   {
     "chain": "ethereum",
-    "wss": "wss://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
-    "https": "https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+    "wss": [
+      "wss://ethereum-rpc.publicnode.com",
+      "wss://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    ],
+    "https": [
+      "https://ethereum-rpc.publicnode.com",
+      "https://ethereum.rpc.thirdweb.com",
+      "https://1rpc.io/eth",
+      "https://eth.drpc.org",
+      "https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    ],
     "nft": "https://eth-mainnet.g.alchemy.com/nft/v3/YOUR_ALCHEMY_KEY"
   },
   {
     "chain": "base",
-    "wss": "wss://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
-    "https": "https://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+    "wss": [
+      "wss://base-rpc.publicnode.com",
+      "wss://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    ],
+    "https": [
+      "https://base-rpc.publicnode.com",
+      "https://base.rpc.thirdweb.com",
+      "https://1rpc.io/base",
+      "https://base.drpc.org",
+      "https://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    ],
     "nft": "https://base-mainnet.g.alchemy.com/nft/v3/YOUR_ALCHEMY_KEY"
   },
   {
     "chain": "robinhood",
-    "wss": "wss://robinhood-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
-    "https": "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+    "wss": [
+      "wss://robinhood.drpc.org",
+      "wss://rpc.ordofi.network",
+      "wss://robinhood-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    ],
+    "https": [
+      "https://rpc.mainnet.chain.robinhood.com",
+      "https://robinhood.drpc.org",
+      "https://4663.rpc.thirdweb.com",
+      "https://robinhood-mainnet-rpc.blockreq.com/v1/rpc/public",
+      "https://rpc.nodeflare.app/robinhood/public",
+      "https://rpc-robinhood.blockmachine.io",
+      "https://robinhood-chain.gateway.tenderly.co",
+      "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    ],
     "nft": "https://robinhood-mainnet.g.alchemy.com/nft/v3/YOUR_ALCHEMY_KEY",
     "lookback": 5000,
-    "maxBackfill": 500
+    "maxBackfill": 2000
   }
 ]

@@ -74,6 +74,13 @@ Fast L2s (Robinhood et al.) produce a block every ~100–250 ms, so the global
 `"lookback": <blocks>` field in `chains.json` to override it (the example sets
 5,000 for robinhood ≈ 20–35 min).
 
+### Multiple RPC endpoints per chain (optional)
+
+`wss` and `https` accept a single URL or an array of URLs. Array order =
+priority: first = primary, last = fallback. The bot rotates WSS endpoints on
+every reconnect and fails over HTTP via a FallbackProvider — put free/keyless
+endpoints first and metered providers (Alchemy) last.
+
 ### 4. Verify locally
 
 ```bash
