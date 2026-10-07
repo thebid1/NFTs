@@ -52,6 +52,7 @@ function loadConfig() {
     SEED_WALLET: process.env.SEED_WALLET || null,
     ADMIN_CHAT_IDS: (process.env.ADMIN_CHAT_IDS || "").split(",").map(s => s.trim()).filter(Boolean),
     LOOKBACK_BLOCKS: Number(process.env.LOOKBACK_BLOCKS || 50),
+    MAX_BACKFILL_BLOCKS: Number(process.env.MAX_BACKFILL_BLOCKS || 500),
     CONFIRMATIONS: Math.max(1, Number(process.env.CONFIRMATIONS || 1)),
     DEDUPE_RETENTION_DAYS: Number(process.env.DEDUPE_RETENTION_DAYS || 7),
   };
@@ -297,22 +298,29 @@ const OS = { "x-api-key": C.OPENSEA_API_KEY };
 const H24 = 24 * 3600 * 1000;
 
 async function readMaxSupply(chain, contract) {
+  const ck = `maxsupply:${chain}:${contract}`;
+  const hit = cacheGet(ck);
+  if (hit != null) return Number(hit);
   for (const sig of MAX_SUPPLY_SELECTORS) {
     try {
       const v = await httpFor(chain).call({ to: contract, data: ethers.id(sig).slice(0, 10) });
       const n = Number(ethers.toBigInt(v));
-      if (Number.isFinite(n) && n > 0) return n;
+      if (Number.isFinite(n) && n > 0) { cacheSet(ck, String(n), H24); return n; }
     } catch { /* try next selector */ }
   }
   return null;
 }
 
 // totalSupply() = tokens minted so far; on-chain is authoritative (metadata caches lag).
+// Short TTL: the value moves during a live mint, so only dedupe bursts of the same event.
 async function readTotalSupply(chain, contract) {
+  const ck = `supply:${chain}:${contract}`;
+  const hit = cacheGet(ck);
+  if (hit != null) return Number(hit);
   try {
     const v = await httpFor(chain).call({ to: contract, data: "0x18160ddd" });
     const n = Number(ethers.toBigInt(v));
-    if (Number.isFinite(n) && n >= 0) return n;
+    if (Number.isFinite(n) && n >= 0) { cacheSet(ck, String(n), 30_000); return n; }
   } catch { /* not an ERC-721/1155 supply fn */ }
   return null;
 }
@@ -329,8 +337,14 @@ async function resolveSlug(chain, contract) {
 
 async function enrich(chain, contract, tokenId) {
   const cfg = chainCfg(chain);
+  const metaCk = `meta:${chain}:${contract}`;
+  const cachedMeta = cacheGet(metaCk);
   // Independent lookups fire in parallel — this is the alert-latency critical path.
-  const metaP = j(`${cfg.nft}/getContractMetadata?contractAddress=${contract}`);
+  // getContractMetadata costs 160 CU on Alchemy; 10-min TTL cache keeps mint frenzies cheap.
+  const metaP = cachedMeta != null
+    ? Promise.resolve(JSON.parse(cachedMeta))
+    : j(`${cfg.nft}/getContractMetadata?contractAddress=${contract}`)
+        .then(r => { try { cacheSet(metaCk, JSON.stringify(r), 10 * 60 * 1000); } catch { /* non-fatal */ } return r; });
   const slugP = resolveSlug(chain, contract).catch(() => null);
   const mintedP = readTotalSupply(chain, contract).catch(() => null);
   const maxP = readMaxSupply(chain, contract).catch(() => null);
@@ -470,14 +484,18 @@ function stopDetector(chain) {
   detectors.delete(chain);
 }
 
+const reconnectFails = new Map(); // chain -> consecutive failed connects; reset on a stable resubscribe
 function scheduleReconnect(chain, gen) {
   const d = detectors.get(chain);
   if (!d || d.stopped || d.gen !== gen || d.restartTimer) return;
+  const n = (reconnectFails.get(chain) ?? 0) + 1;
+  reconnectFails.set(chain, n);
+  const delay = Math.min(60_000, 5_000 * 2 ** (n - 1)); // 5s → 10s → 20s → 40s → 60s cap
   d.restartTimer = setTimeout(async () => {
     d.restartTimer = null;
     try { await backfill(chain); } catch (e) { log(`[${chain}] pre-reconnect backfill failed:`, e.message); }
     await startDetector(chain);
-  }, 5000);
+  }, delay);
 }
 
 async function startDetector(chain) {
@@ -505,11 +523,13 @@ async function startDetector(chain) {
   } catch (e) { log(`[${chain}] websocket connect failed:`, e.message); scheduleReconnect(chain, gen); return; }
 
   for (const f of filters) wss.on({ topics: f.topics }, entry => enqueue(() => handleLog(chain, entry)));
+  reconnectFails.set(chain, 0);
   log(`[${chain}] subscribed (${filters.map(f => f.label).join("+")}) to ${wallets().length} wallet(s)`);
 
-  // liveness probe: catches half-dead sockets that never emit close
+  // liveness probe: catches half-dead sockets that never emit close.
+  // net_version is 0 CU on Alchemy; eth_blockNumber is 10 CU per call.
   d.watchdog = setInterval(() => {
-    wss.getBlockNumber().catch(() => onWsDown("watchdog"));
+    wss.send("net_version", []).catch(() => onWsDown("watchdog"));
   }, 60_000);
 
   await backfill(chain); // cold start / gap catch-up from persisted cursor
@@ -522,10 +542,15 @@ async function backfill(chain) {
   if (!filters.length) return;
   const provider = httpFor(chain);
   const lookback = Number(cfg.lookback) > 0 ? Number(cfg.lookback) : C.LOOKBACK_BLOCKS;
+  const maxBackfill = Number(cfg.maxBackfill) > 0 ? Number(cfg.maxBackfill) : C.MAX_BACKFILL_BLOCKS;
   const head = await provider.getBlockNumber();
-  const to = head - C.CONFIRMATIONS + 1;
+  let to = head - C.CONFIRMATIONS + 1;
   const from = Math.max(getCursor(chain) != null ? getCursor(chain) + 1 : to - lookback + 1, 0);
   if (from > to) return;
+  if (to - from + 1 > maxBackfill) { // cap CU spend per run; the cursor advances progressively on later runs
+    log(`[${chain}] gap ${to - from + 1} blocks > maxBackfill=${maxBackfill}; slicing ${from}..${from + maxBackfill - 1} this run`);
+    to = from + maxBackfill - 1;
+  }
   log(`[${chain}] backfill blocks ${from}..${to}`);
   for (let s = from; s <= to; s += CHUNK) {
     const e = Math.min(s + CHUNK - 1, to);
@@ -542,6 +567,16 @@ async function restartAllDetectors() {
   for (const c of CHAINS) {
     try { await startDetector(c.chain); } catch (e) { log(`[${c.chain}] start failed:`, e.message); }
   }
+}
+
+let restartTimer = null;
+// Coalesce bursts (bulk import, rapid /add|/remove) into one resubscribe cycle.
+function queueRestartAll() {
+  if (restartTimer) return;
+  restartTimer = setTimeout(() => {
+    restartTimer = null;
+    restartAllDetectors().catch(e => log("detectors:", e.message));
+  }, 2_500);
 }
 
 // ---------- telegram command loop (long polling, outbound only) ----------
@@ -567,7 +602,7 @@ async function doAdd(reply, input, owner) {
   }
   upsertWallet(addr, label, owner);
   await reply(`✅ Now tracking ${label ? `<b>${esc(label)}</b> ` : ""}<code>${addr}</code> on ${CHAINS.map(c => c.chain).join(", ")} — alerts will come to you here, privately.`);
-  await restartAllDetectors(); // live resubscribe; cursor-protected backfill covers the gap
+  queueRestartAll(); // live resubscribe; cursor-protected backfill covers the gap
 }
 
 // Shared /remove logic: arg = address or exact label, scoped to the caller's own wallets.
@@ -578,7 +613,7 @@ async function doRemove(reply, arg, owner) {
   if (!addr) return reply("Not found — send an address or an exact label from YOUR list (/list).");
   q.rmWallet.run(addr, String(owner));
   await reply(`🗑 Removed ${byLabel?.label ? `<b>${esc(byLabel.label)}</b> ` : ""}<code>${addr}</code>`);
-  await restartAllDetectors();
+  queueRestartAll();
 }
 
 // Channels are independent tenants: commands are accepted from channel ADMINS only,
@@ -724,7 +759,7 @@ async function handleDocument(m) {
     upsertWallet(addr, label, chatId);
     if (exists) updated++; else added++;
   }
-  await restartAllDetectors();
+  queueRestartAll();
   await reply(`✅ Import done: <b>${added}</b> added, <b>${updated}</b> already tracked (labels updated), <b>${bad}</b> skipped` +
     (badSample.length ? `.\nSkipped examples:\n<code>${badSample.map(esc).join("\n")}</code>` : "."));
 }

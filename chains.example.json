@@ -16,6 +16,7 @@
     "wss": "wss://robinhood-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
     "https": "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
     "nft": "https://robinhood-mainnet.g.alchemy.com/nft/v3/YOUR_ALCHEMY_KEY",
-    "lookback": 5000
+    "lookback": 5000,
+    "maxBackfill": 500
   }
 ]
