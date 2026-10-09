@@ -31,21 +31,21 @@ The bot is **multi-user**: everyone with access gets a private watchlist.
   messages the bot and you get a "🙋 Access request" note with their name and
   id — reply `/allow <id>` from your private chat and they're in, no restart.
   `/revoke <id>` removes access. Unknown users get an invite-only notice.
-- **Privacy:** each user's wallets, labels, and alerts are visible only to
-  them. `/list` and `/remove` touch only the caller's own wallets; the same
-  address can be tracked by several users independently and each gets their
-  own alert. Detection stays efficient: one shared on-chain subscription for
-  everyone.
-- Alerts are **DM'd to whoever tracks the wallet**. `TELEGRAM_CHAT_ID` = the
-  owner account — access requests and error notices go there.
-- **Channels are independent workspaces (not mirrors):** add the bot to any
-  channel (as admin) and run `/add` right there — that channel gets its OWN
-  watchlist and its alerts post in the channel. Only channel admins can manage
-  a channel's list (verified via getChatAdministrators, cached 5 min);
-  anonymous "post as channel" counts as admin. A channel's wallets are
-  separate from every user's DM watchlist. `/allow`/`/revoke` remain
-  private-chat owner functions.
-- Commands work from private chats only, admins only.
+- **Separate workspaces:** each private chat, group, supergroup, and channel
+  has its own SQLite watchlist at `trackers/<chat-id>.db`. A group's or
+  channel's wallets and labels are never stored in a user's watchlist database.
+  The same address can be tracked independently in multiple chats, and each
+  chat gets its own alerts. On startup, existing watchlists are migrated from
+  `tracker.db` into the matching workspace database. Detection stays efficient
+  with one shared on-chain subscription across all workspaces.
+- **Groups and channels:** add the bot to the chat; only group/channel admins
+  can manage that chat's watchlist. In channels, make the bot an administrator.
+  Anonymous admins can manage groups by posting as the group and channels by
+  posting as the channel. Alerts are sent to the chat whose watchlist contains
+  the wallet.
+- Private chats remain invite-only, with access controlled by
+  `ADMIN_CHAT_IDS` or `/allow` and `/revoke`. Access requests and bot error
+  notices go to the owner account (`TELEGRAM_CHAT_ID`).
 
 ### 3. Configure
 
@@ -132,7 +132,7 @@ Check health from your phone: Telegram `/status` (reports each chain's cursor).
 | List / health | `/list`, `/status` · VPS logs: `pm2 logs nft-tracker` |
 | Restart after key/config change | edit `.env` or `chains.json`, then `pm2 restart nft-tracker --update-env` |
 | Add/remove a chain | edit `chains.json`, then `pm2 restart nft-tracker --update-env` |
-| Backup | `tar czf tracker-backup.tgz -C ~ nft-tracker/bot.js nft-tracker/.env nft-tracker/chains.json nft-tracker/tracker.db` |
+| Backup | `tar czf tracker-backup.tgz -C ~ nft-tracker/bot.js nft-tracker/.env nft-tracker/chains.json nft-tracker/tracker.db nft-tracker/trackers` |
 
 ## CLI modes
 

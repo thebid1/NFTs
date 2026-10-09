@@ -108,15 +108,18 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ---------- state ----------
 const db = new Database(path.join(__dirname, "tracker.db"));
-db.pragma("journal_mode = WAL");
+db.pragma("journal_mode = WAL");   // dashboard process shares this file
+db.pragma("busy_timeout = 5000");
 db.exec(`CREATE TABLE IF NOT EXISTS dedupe(key TEXT PRIMARY KEY, created_at INTEGER);
          CREATE TABLE IF NOT EXISTS cursor(chain TEXT PRIMARY KEY, last_block INTEGER);
          CREATE TABLE IF NOT EXISTS wallets(address TEXT NOT NULL, added_at INTEGER, label TEXT, owner_chat_id TEXT, PRIMARY KEY(address, owner_chat_id));
          CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, value TEXT, expires_at INTEGER);
          CREATE TABLE IF NOT EXISTS retry_queue(key TEXT PRIMARY KEY, payload TEXT, run_at INTEGER);
-         CREATE TABLE IF NOT EXISTS admins(chat_id TEXT PRIMARY KEY, added_at INTEGER);`);
+         CREATE TABLE IF NOT EXISTS mint_events(id INTEGER PRIMARY KEY AUTOINCREMENT, chain TEXT, tx_hash TEXT, log_index INTEGER, wallet TEXT, contract TEXT, token_id TEXT, ts INTEGER);
+         CREATE TABLE IF NOT EXISTS admins(chat_id TEXT PRIMARY KEY, added_at INTEGER);
+         CREATE TABLE IF NOT EXISTS workspaces(chat_id TEXT PRIMARY KEY, chat_type TEXT NOT NULL, title TEXT, created_at INTEGER NOT NULL);`);
 
-// migrations for DBs created before labels / per-user ownership existed —
+// migrations for legacy global DBs created before labels / per-chat ownership —
 // MUST run before the prepared statements below reference the new columns.
 const walletsDdl = () => db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='wallets'").get()?.sql ?? "";
 if (!walletsDdl().includes("owner_chat_id")) {
@@ -135,28 +138,78 @@ const q = {
   addSeen: db.prepare("INSERT OR IGNORE INTO dedupe VALUES (?,?)"),
   getCursor: db.prepare("SELECT last_block FROM cursor WHERE chain=?"),
   setCursor: db.prepare("INSERT INTO cursor(chain,last_block) VALUES(?,?) ON CONFLICT(chain) DO UPDATE SET last_block=excluded.last_block"),
-  rmWallet: db.prepare("DELETE FROM wallets WHERE address=? AND owner_chat_id=?"),
   cacheGet: db.prepare("SELECT value, expires_at FROM cache WHERE key=?"),
   cacheSet: db.prepare("INSERT INTO cache(key,value,expires_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at"),
   cacheDel: db.prepare("DELETE FROM cache WHERE key=?"),
   addRetry: db.prepare("INSERT OR REPLACE INTO retry_queue VALUES (?,?,?)"),
   rmRetry: db.prepare("DELETE FROM retry_queue WHERE key=?"),
+  addMintEvent: db.prepare("INSERT INTO mint_events(chain,tx_hash,log_index,wallet,contract,token_id,ts) VALUES (?,?,?,?,?,?,?)"),
   pruneDedupe: db.prepare("DELETE FROM dedupe WHERE created_at<?"),
 };
 
+const workspaceDbs = new Map();
+function openWorkspaceDatabase(filename) {
+  const workspace = new Database(filename);
+  workspace.pragma("journal_mode = WAL");
+  workspace.pragma("busy_timeout = 5000");
+  workspace.exec("CREATE TABLE IF NOT EXISTS wallets(address TEXT PRIMARY KEY, added_at INTEGER NOT NULL, label TEXT)");
+  return workspace;
+}
+
+function workspaceDb(chatId, chatType = "unknown", title = null) {
+  const id = String(chatId);
+  const fileId = /^-?\d+$/.test(id) ? id
+    : /^@[A-Za-z0-9_]{5,32}$/.test(id) ? `username-${id.slice(1).toLowerCase()}`
+      : null;
+  if (!fileId) throw new Error(`invalid Telegram chat id: ${id}`);
+  let workspace = workspaceDbs.get(id);
+  if (!workspace) {
+    const dir = path.join(__dirname, "trackers");
+    fs.mkdirSync(dir, { recursive: true });
+    workspace = openWorkspaceDatabase(path.join(dir, `${fileId}.db`));
+    workspaceDbs.set(id, workspace);
+  }
+  db.prepare(
+    "INSERT INTO workspaces(chat_id,chat_type,title,created_at) VALUES(?,?,?,?) " +
+    "ON CONFLICT(chat_id) DO UPDATE SET " +
+    "chat_type=CASE WHEN excluded.chat_type='unknown' THEN workspaces.chat_type ELSE excluded.chat_type END," +
+    "title=COALESCE(excluded.title,workspaces.title)"
+  ).run(id, chatType, title, Date.now());
+  return workspace;
+}
+
+for (const row of db.prepare("SELECT chat_id, chat_type, title FROM workspaces").all()) {
+  workspaceDb(row.chat_id, row.chat_type, row.title);
+}
+
+// Move legacy shared watchlists into a separate database for each Telegram chat.
+const legacyWallets = db.prepare("SELECT address, added_at, label, owner_chat_id FROM wallets").all();
+for (const row of legacyWallets) {
+  if (row.owner_chat_id == null) continue;
+  const tenant = workspaceDb(row.owner_chat_id);
+  tenant.prepare("INSERT OR IGNORE INTO wallets(address,added_at,label) VALUES(?,?,?)")
+    .run(row.address, row.added_at ?? Date.now(), row.label);
+}
+if (legacyWallets.length) db.prepare("DELETE FROM wallets WHERE owner_chat_id IS NOT NULL").run();
+
+const workspaceWalletRows = chatId => workspaceDb(chatId).prepare(
+  "SELECT address, label FROM wallets ORDER BY added_at"
+).all();
 const walletRows = (owner = null) => owner == null
-  ? db.prepare("SELECT address, label, owner_chat_id FROM wallets ORDER BY added_at").all()
-  : db.prepare("SELECT address, label, owner_chat_id FROM wallets WHERE owner_chat_id=? ORDER BY added_at").all(owner);
+  ? [...workspaceDbs.entries()].flatMap(([chatId, tenant]) =>
+    tenant.prepare("SELECT address, label, ? AS owner_chat_id FROM wallets ORDER BY added_at").all(chatId))
+  : workspaceWalletRows(owner).map(r => ({ ...r, owner_chat_id: String(owner) }));
 const wallets = () => [...new Set(walletRows().map(r => r.address))]; // union — one shared subscription set
 const labelFor = (addr, owner) => walletRows(owner).find(r => r.address === addr)?.label ?? null;
 const ownersOf = addr => [...new Set(walletRows().filter(r => r.address === addr).map(r => r.owner_chat_id))];
-// Insert per-user; a new label overwrites, omitting it keeps the existing one.
-const upsertWallet = (addr, label, owner) => db.prepare(
-  "INSERT INTO wallets(address,added_at,label,owner_chat_id) VALUES (?,?,?,?) " +
-  "ON CONFLICT(address,owner_chat_id) DO UPDATE SET label=COALESCE(excluded.label, wallets.label)"
-).run(addr, Date.now(), label, String(owner));
+// A new label overwrites the existing one; omitting it keeps the existing label.
+const upsertWallet = (addr, label, owner) => workspaceDb(owner).prepare(
+  "INSERT INTO wallets(address,added_at,label) VALUES (?,?,?) " +
+  "ON CONFLICT(address) DO UPDATE SET label=COALESCE(excluded.label, wallets.label)"
+).run(addr, Date.now(), label);
 
 if (!wallets().length && C.SEED_WALLET && /^0x[0-9a-fA-F]{40}$/.test(C.SEED_WALLET)) {
+  workspaceDb(C.TELEGRAM_CHAT_ID, "private");
   upsertWallet(C.SEED_WALLET.toLowerCase(), null, C.TELEGRAM_CHAT_ID);
   log("seeded wallet", C.SEED_WALLET.toLowerCase());
 }
@@ -184,10 +237,12 @@ function parseMintLog(log) {
   const t = log.topics;
   if (t[0] === TOPIC_TRANSFER) {
     if (t[1] !== ZERO32) return null;               // from must be zero address
+    if (!t[3]) return null;                          // 3-topic lookalike (e.g. ERC-20 genesis) — not an ERC-721 mint
     return { wallet: addrFromTopic(t[2]), contract: log.address.toLowerCase(), tokenId: String(ethers.toBigInt(t[3])) };
   }
   if (t[0] === TOPIC_TRANSFER_SINGLE) {
     if (t[2] !== ZERO32) return null;               // from must be zero address
+    if (!log.data || log.data.length < 130) return null; // needs id+value words — malformed lookalikes crash the decoder
     return { wallet: addrFromTopic(t[3]), contract: log.address.toLowerCase(), tokenId: String(ethers.toBigInt("0x" + log.data.slice(2, 66))) };
   }
   return null;
@@ -443,6 +498,9 @@ async function processMint(chain, lg, parsed) {
     return;
   }
   if (lg.blockNumber > 0) setCursorMax(chain, lg.blockNumber);
+  try {
+    q.addMintEvent.run(chain, lg.transactionHash, lg.index, wallet, contract, tokenId != null ? String(tokenId) : null, Date.now());
+  } catch (e) { log("mint_events insert failed (non-fatal):", e.message); }
   let info;
   try {
     info = await enrich(chain, contract, tokenId); // enriched once, delivered to each owner
@@ -467,10 +525,14 @@ async function processMint(chain, lg, parsed) {
 }
 
 async function handleLog(chain, lg) {
-  if (lg.removed) return;                   // reorg replay: dedupe already handled it
-  const parsed = parseMintLog(lg);
-  if (!parsed) return;
-  await processMint(chain, lg, parsed);
+  try {
+    if (lg.removed) return;                   // reorg replay: dedupe already handled it
+    const parsed = parseMintLog(lg);
+    if (!parsed) return;
+    await processMint(chain, lg, parsed);
+  } catch (e) {
+    log(`[${chain}] handleLog error (log skipped):`, e.message);
+  }
 }
 
 // Serialize event processing (enrichment is rate-limit friendly).
@@ -613,43 +675,66 @@ async function doAdd(reply, input, owner) {
     return reply("That doesn't look like a wallet — send <code>0x…</code> or <code>name.eth</code>.");
   }
   upsertWallet(addr, label, owner);
-  await reply(`✅ Now tracking ${label ? `<b>${esc(label)}</b> ` : ""}<code>${addr}</code> on ${CHAINS.map(c => c.chain).join(", ")} — alerts will come to you here, privately.`);
+  await reply(`✅ Now tracking ${label ? `<b>${esc(label)}</b> ` : ""}<code>${addr}</code> on ${CHAINS.map(c => c.chain).join(", ")} — alerts will come to this chat.`);
   queueRestartAll(); // live resubscribe; cursor-protected backfill covers the gap
 }
 
 // Shared /remove logic: arg = address or exact label, scoped to the caller's own wallets.
 async function doRemove(reply, arg, owner) {
-  const rows = walletRows(owner);
+  const rows = workspaceWalletRows(owner);
   const byLabel = rows.find(r => r.label && r.label.toLowerCase() === arg.toLowerCase());
   const addr = /^0x[0-9a-fA-F]{40}$/.test(arg) ? arg.toLowerCase() : byLabel?.address;
-  if (!addr) return reply("Not found — send an address or an exact label from YOUR list (/list).");
-  q.rmWallet.run(addr, String(owner));
+  if (!addr) return reply("Not found — send an address or an exact label from this chat's list (/list).");
+  workspaceDb(owner).prepare("DELETE FROM wallets WHERE address=?").run(addr);
   await reply(`🗑 Removed ${byLabel?.label ? `<b>${esc(byLabel.label)}</b> ` : ""}<code>${addr}</code>`);
   queueRestartAll();
 }
 
-// Channels are independent tenants: commands are accepted from channel ADMINS only,
-// and wallets added there belong to the channel (alerts post in the channel).
-const channelAdminCache = new Map(); // chatId -> { ids: Set<userId>, ts }
+// Group and channel chats are independent tenants; only their admins can manage them.
+const chatAdminCache = new Map(); // chatId -> { ids: Set<userId>, ts }
 async function isChannelAdmin(m) {
   const chatId = String(m.chat.id);
   if (m.sender_chat && String(m.sender_chat.id) === chatId) return true; // posted as the channel itself
   if (!m.from?.id) return false;
-  const hit = channelAdminCache.get(chatId);
+  const hit = chatAdminCache.get(chatId);
   if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.ids.has(m.from.id);
   try {
     const r = await tg("getChatAdministrators", { chat_id: chatId });
     const ids = new Set((r.result ?? []).map(a => a.user?.id).filter(Boolean));
-    channelAdminCache.set(chatId, { ids, ts: Date.now() });
+    chatAdminCache.set(chatId, { ids, ts: Date.now() });
     return ids.has(m.from.id);
-  } catch { return false; }
+  } catch (e) {
+    log(`channel admin check failed for ${chatId}:`, e.message);
+    return false;
+  }
 }
 
-// Shared gate for commands AND file uploads: private admins, or channel admins in channels.
+async function isGroupAdmin(m) {
+  const chatId = String(m.chat.id);
+  if (m.sender_chat && String(m.sender_chat.id) === chatId) return true; // anonymous admin
+  if (!m.from?.id) return false;
+  const hit = chatAdminCache.get(chatId);
+  if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.ids.has(m.from.id);
+  try {
+    const r = await tg("getChatAdministrators", { chat_id: chatId });
+    const ids = new Set((r.result ?? []).map(a => a.user?.id).filter(Boolean));
+    chatAdminCache.set(chatId, { ids, ts: Date.now() });
+    return ids.has(m.from.id);
+  } catch (e) {
+    log(`group admin check failed for ${chatId}:`, e.message);
+    return false;
+  }
+}
+
+// Shared gate for commands AND file uploads.
 async function authorize(m) {
   const chatId = String(m.chat.id);
   const isPrivate = m.chat?.type === "private";
   const reply = text => tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+  const allowWorkspace = () => {
+    workspaceDb(chatId, m.chat.type, m.chat.title ?? null);
+    return { ok: true, chatId, isPrivate, reply };
+  };
   if (isPrivate) {
     if (!adminIds().includes(chatId)) {                 // unknown user: invite-only notice + one access request to the owner
       if (!cacheGet(`req:${chatId}`)) {
@@ -660,13 +745,16 @@ async function authorize(m) {
       await reply("⛔ This bot is invite-only — the owner has been notified of your request.").catch(() => {});
       return { ok: false };
     }
-    return { ok: true, chatId, isPrivate, reply };
+    return allowWorkspace();
   }
   if (m.chat?.type === "channel") {
-    if (await isChannelAdmin(m)) return { ok: true, chatId, isPrivate, reply }; // only channel admins manage the channel's watchlist
+    if (await isChannelAdmin(m)) return allowWorkspace();
     return { ok: false };
   }
-  return { ok: false };                                 // groups/supergroups not supported
+  if (m.chat?.type === "group" || m.chat?.type === "supergroup") {
+    if (await isGroupAdmin(m)) return allowWorkspace();
+  }
+  return { ok: false };
 }
 
 async function handleCommand(m) {
@@ -675,7 +763,7 @@ async function handleCommand(m) {
   const { chatId, isPrivate, reply } = auth;
   const text = m.text.trim();
   const parts = text.split(/\s+/);
-  const cmd = parts[0];
+  const cmd = parts[0].split("@")[0];
   const arg = parts[1];
 
   // Step-by-step mode: a pending prompt consumes this chat's next plain message.
@@ -714,18 +802,18 @@ async function handleCommand(m) {
     db.prepare("DELETE FROM admins WHERE chat_id=?").run(arg);
     await reply(`🗑 Revoked admin <code>${arg}</code>`);
   } else if (cmd === "/list") {
-    await reply("👛 Your wallets:\n" + (walletRows(chatId).map(r => `${r.label ? `<b>${esc(r.label)}</b> — ` : ""}<code>${r.address}</code>`).join("\n") || "(none)"));
+    await reply("👛 This chat's wallets:\n" + (workspaceWalletRows(chatId).map(r => `${r.label ? `<b>${esc(r.label)}</b> — ` : ""}<code>${r.address}</code>`).join("\n") || "(none)"));
   } else if (cmd === "/status") {
     const perChain = CHAINS.map(c => {
       const live = detectors.get(c.chain)?.provider ? "live" : "idle";
       return `${c.chain} @ ${getCursor(c.chain) ?? "—"} (${live})`;
     }).join("\n");
-    await reply(`⚙️ up ${Math.floor(process.uptime())}s · ${wallets().length} wallet(s)\n${perChain}`);
+    await reply(`⚙️ up ${Math.floor(process.uptime())}s · ${workspaceWalletRows(chatId).length} wallet(s) in this chat\n${perChain}`);
   } else if (cmd === "/test") {
     await notify(SAMPLE_INFO, "0x000000000000000000000000000000000000dEaD", "42", null, CHAINS[0]?.chain ?? "ethereum", "Sample Wallet", chatId);
     await reply("✅ sample sent here");
   } else if (cmd === "/help") {
-    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name]); bulk: send a .txt/.csv file — one wallet per line, optional label\n/remove — untrack by address or label\n/list — this chat's wallets\n/status — health\n/test — sample alert to this chat\n/allow <id> — grant bot access (owner, private chat)\n/revoke <id> — remove access (owner, private chat)\n/cancel — abort a pending prompt\nIn a channel: channel admins manage that channel's own watchlist — everything stays in the channel.");
+    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name]); bulk: send a .txt/.csv file — one wallet per line, optional label\n/remove — untrack by address or label\n/list — this chat's wallets\n/status — health\n/test — sample alert to this chat\n/allow <id> — grant bot access (owner, private chat)\n/revoke <id> — remove access (owner, private chat)\n/cancel — abort a pending prompt\nIn groups and channels, admins manage that chat's own watchlist; alerts stay in that chat.");
   }
 }
 
@@ -784,7 +872,7 @@ async function commandLoop() {
       for (const u of r.result ?? []) {
         offset = u.update_id + 1;
         cacheSet("tg_offset", String(offset), null);
-        const m = u.message ?? u.edited_message;
+        const m = u.message ?? u.edited_message ?? u.channel_post ?? u.edited_channel_post;
         if (m?.text) await handleCommand(m).catch(e => log("command failed:", e.message));
         else if (m?.document) await handleDocument(m).catch(e => log("document failed:", e.message));
       }
@@ -829,6 +917,16 @@ function selftest() {
   const seen1 = tdb.prepare("INSERT OR IGNORE INTO dedupe VALUES (?,?)").run("k", 1);
   const seen2 = tdb.prepare("INSERT OR IGNORE INTO dedupe VALUES (?,?)").run("k", 2);
   assert.equal(seen1.changes, 1); assert.equal(seen2.changes, 0);
+  // A wallet tracked in two chat workspaces keeps an independent label in each database.
+  const workspaceA = openWorkspaceDatabase(":memory:");
+  const workspaceB = openWorkspaceDatabase(":memory:");
+  workspaceA.prepare("INSERT INTO wallets VALUES (?,?,?)").run(W1, 1, "group");
+  workspaceB.prepare("INSERT INTO wallets VALUES (?,?,?)").run(W1, 1, "channel");
+  assert.equal(workspaceA.prepare("SELECT label FROM wallets WHERE address=?").get(W1).label, "group");
+  assert.equal(workspaceB.prepare("SELECT label FROM wallets WHERE address=?").get(W1).label, "channel");
+  workspaceA.close();
+  workspaceB.close();
+  tdb.close();
 
   // chain-scoped dedupe keys (multi-chain: same tx on two chains = two alerts)
   const keyEth = `ethereum:0xaaa:1`, keyBase = `base:0xaaa:1`;
@@ -871,6 +969,18 @@ async function main() {
     ],
     scope: { type: "all_private_chats" },
   }).catch(e => log("setMyCommands:", e.message));
+  tg("setMyCommands", {
+    commands: [
+      { command: "add", description: "Track a wallet: 0x… or name.eth, optional label" },
+      { command: "remove", description: "Untrack by address or label" },
+      { command: "list", description: "Show this chat's tracked wallets" },
+      { command: "status", description: "Bot health and chain cursors" },
+      { command: "test", description: "Send a sample alert to this chat" },
+      { command: "help", description: "Show all commands" },
+      { command: "cancel", description: "Abort a pending prompt" },
+    ],
+    scope: { type: "all_group_chats" },
+  }).catch(e => log("setMyCommands (groups):", e.message));
   flushRetries();
   prune();
   setInterval(prune, 24 * 3600 * 1000).unref();
