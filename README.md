@@ -19,7 +19,7 @@ not in the repo.
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Telegram → @BotFather → `/newbot` |
 | `TELEGRAM_CHAT_ID` | Message your bot, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `chat.id` (or run `node bot.js --chat-id`) |
-| Alchemy URLs per chain | alchemy.com → one free app **per chain** → copy its HTTPS, WSS, and NFT API URLs |
+| Alchemy URLs per chain | alchemy.com → create an app **per chain** → copy its HTTPS, WSS, and NFT API URLs |
 | `OPENSEA_API_KEY` | `curl -X POST https://api.opensea.io/api/v2/auth/keys` (instant, free — rate-limited per IP; or a non-expiring key at opensea.io → Settings → Developer) |
 
 ### 2. Multiple users (optional)
@@ -29,8 +29,11 @@ The bot is **multi-user**: everyone with access gets a private watchlist.
 - **Access:** (1) list private chat ids in `ADMIN_CHAT_IDS` in `.env`
   (comma-separated, needs a restart); or (2) **in-bot approval:** a friend
   messages the bot and you get a "🙋 Access request" note with their name and
-  id — reply `/allow <id>` from your private chat and they're in, no restart.
-  `/revoke <id>` removes access. Unknown users get an invite-only notice.
+  id — reply `/allow <id>` from the owner private chat and they're in, no
+  restart. The owner can use `/admins` to list access and `/revoke <id>` to
+  revoke it. Revoking also removes that private chat's wallet list and pending
+  alert retries. Revocations override IDs in `ADMIN_CHAT_IDS`; `/allow <id>`
+  restores access. Unknown users get an invite-only notice.
 - **Separate workspaces:** each private chat, group, supergroup, and channel
   has its own SQLite watchlist at `trackers/<chat-id>.db`. A group's or
   channel's wallets and labels are never stored in a user's watchlist database.
@@ -57,7 +60,11 @@ cp chains.example.json chains.json  # fill in one block per chain you want
 `chains.json` holds your Alchemy keys inside the URLs — treat it like `.env`
 (it is gitignored and `chmod 600`'d by `deploy.sh`). Add/remove a chain block
 at any time, then `pm2 restart nft-tracker --update-env` (or Telegram `/add`,
-which resubscribes live). Alchemy URL patterns for common chains:
+which resubscribes live). The example uses Alchemy for all chain RPC and NFT
+API calls. Mint collection statistics/offers are still fetched from OpenSea.
+Use Alchemy URLs for every configured `wss`, `https`, and `nft` endpoint if
+you want Alchemy to be the only RPC/NFT provider. Alchemy URL patterns for
+common chains:
 
 | chain | host prefix |
 |---|---|
@@ -78,8 +85,8 @@ Fast L2s (Robinhood et al.) produce a block every ~100–250 ms, so the global
 
 `wss` and `https` accept a single URL or an array of URLs. Array order =
 priority: first = primary, last = fallback. The bot rotates WSS endpoints on
-every reconnect and fails over HTTP via a FallbackProvider — put free/keyless
-endpoints first and metered providers (Alchemy) last.
+every reconnect and fails over HTTP via a FallbackProvider. If using multiple
+endpoints, keep them all on Alchemy and be aware each fallback can incur usage.
 
 ### 4. Verify locally
 
@@ -129,10 +136,20 @@ Check health from your phone: Telegram `/status` (reports each chain's cursor).
 |---|---|
 | Add a wallet | Telegram `/add 0x… [name]` or `/add name.eth [name]` — or send `/add` alone for a step-by-step prompt. **Bulk:** send a `.txt`/`.csv` file (one wallet per line, optional label — space or comma separated; `#` comments and a header row are ignored; max 1,000 rows). Applied to **all** chains, live resubscribe |
 | Remove | `/remove 0x…` or `/remove name` (also step-by-step if sent alone) |
-| List / health | `/list`, `/status` · VPS logs: `pm2 logs nft-tracker` |
+| List / health | `/list`, `/status` |
+| Grant/revoke private access | Owner only: `/admins`, `/allow <chat-id>`, `/revoke <chat-id>` |
+| Read recent logs cleanly | `pm2 logs nft-tracker --lines 100 --nostream --raw` |
+| Follow logs cleanly | `pm2 logs nft-tracker --lines 50 --raw` |
 | Restart after key/config change | edit `.env` or `chains.json`, then `pm2 restart nft-tracker --update-env` |
 | Add/remove a chain | edit `chains.json`, then `pm2 restart nft-tracker --update-env` |
 | Backup | `tar czf tracker-backup.tgz -C ~ nft-tracker/bot.js nft-tracker/.env nft-tracker/chains.json nft-tracker/tracker.db nft-tracker/trackers` |
+
+`deploy.sh` configures PM2 log rotation (10 MB per file, 7 compressed files).
+Telegram sends are tried immediately, after 2 seconds, and after 8 seconds.
+If enrichment or alert delivery still fails, the bot stores a retry in SQLite
+for 60 seconds later. A retry attempts the full alert, then a reduced alert;
+if Telegram cannot accept either, it keeps retrying with backoff up to once an
+hour. Pending retries survive bot restarts.
 
 ## CLI modes
 

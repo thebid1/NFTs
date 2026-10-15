@@ -21,6 +21,14 @@ if ! command -v pm2 >/dev/null 2>&1; then
   sudo npm i -g pm2
 fi
 
+echo "==> configuring PM2 log rotation"
+if ! pm2 module:list 2>/dev/null | grep -q "pm2-logrotate"; then
+  pm2 install pm2-logrotate
+fi
+pm2 set pm2-logrotate:max_size 10M
+pm2 set pm2-logrotate:retain 7
+pm2 set pm2-logrotate:compress true
+
 echo "==> installing dependencies"
 npm install --omit=dev
 
@@ -45,4 +53,5 @@ fi
 pm2 save
 
 echo "==> done. logs: pm2 logs nft-tracker"
+echo "    clean snapshot: pm2 logs nft-tracker --lines 100 --nostream --raw"
 echo "    if this is the first deploy, run: pm2 startup   (then copy-paste the printed sudo command)"

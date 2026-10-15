@@ -24,7 +24,7 @@ const ZERO = "0x0000000000000000000000000000000000000000";
 const ZERO32 = ethers.zeroPadValue(ZERO, 32);
 const TOPIC_TRANSFER = ethers.id("Transfer(address,address,uint256)");
 const TOPIC_TRANSFER_SINGLE = ethers.id("TransferSingle(address,address,address,uint256,uint256)");
-const CHUNK = Math.max(10, Number(process.env.GETLOGS_CHUNK) || 10); // Alchemy free tier: max 10-block range per eth_getLogs call
+const CHUNK = Math.max(10, Number(process.env.GETLOGS_CHUNK) || 10); // Keep eth_getLogs ranges modest to limit provider errors.
 const FETCH_TIMEOUT_MS = 15000;
 const EXPLORERS = {
   ethereum: "https://etherscan.io",
@@ -97,12 +97,15 @@ const C = loadConfig();
 const CHAINS = loadChains();
 const chainCfg = name => CHAINS.find(c => c.chain === name);
 const urlList = v => (v == null ? [] : Array.isArray(v) ? v : [v]).filter(Boolean);
-// Admins: env bootstrap list ∪ runtime /allow list (persisted in SQLite).
-// Defaults to the alert destination if neither is configured.
+// Private-chat access: owner + env bootstrap list + runtime grants, minus owner revocations.
 const dbAdmins = () => db.prepare("SELECT chat_id FROM admins").all().map(r => r.chat_id);
-const adminIds = () => [...new Set([...(C.ADMIN_CHAT_IDS.length ? C.ADMIN_CHAT_IDS : [C.TELEGRAM_CHAT_ID]), ...dbAdmins()])];
-// Private chat used for owner-only notices (falls back to the alert channel).
-const ownerChat = () => adminIds().find(x => /^-?\d+$/.test(x)) ?? C.TELEGRAM_CHAT_ID;
+const revokedAdminIds = () => new Set(db.prepare("SELECT chat_id FROM revoked_admins").all().map(r => r.chat_id));
+const privateAdminIds = (owner, configured, granted, revoked) =>
+  [...new Set([String(owner), ...configured, ...granted])]
+    .filter(id => id === String(owner) || !revoked.has(id));
+const adminIds = () => privateAdminIds(C.TELEGRAM_CHAT_ID, C.ADMIN_CHAT_IDS, dbAdmins(), revokedAdminIds());
+// Private chat used for owner-only notices.
+const ownerChat = () => C.TELEGRAM_CHAT_ID;
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -117,6 +120,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS dedupe(key TEXT PRIMARY KEY, created_at INTE
          CREATE TABLE IF NOT EXISTS retry_queue(key TEXT PRIMARY KEY, payload TEXT, run_at INTEGER);
          CREATE TABLE IF NOT EXISTS mint_events(id INTEGER PRIMARY KEY AUTOINCREMENT, chain TEXT, tx_hash TEXT, log_index INTEGER, wallet TEXT, contract TEXT, token_id TEXT, ts INTEGER);
          CREATE TABLE IF NOT EXISTS admins(chat_id TEXT PRIMARY KEY, added_at INTEGER);
+         CREATE TABLE IF NOT EXISTS revoked_admins(chat_id TEXT PRIMARY KEY, revoked_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS workspaces(chat_id TEXT PRIMARY KEY, chat_type TEXT NOT NULL, title TEXT, created_at INTEGER NOT NULL);`);
 
 // migrations for legacy global DBs created before labels / per-chat ownership —
@@ -448,28 +452,43 @@ async function enrich(chain, contract, tokenId) {
   };
 }
 
-// ---------- retry queue (OpenSea indexing lag) ----------
+// ---------- durable retry queue (enrichment and Telegram delivery) ----------
 function scheduleRetry(key, payload, delayMs) {
   q.addRetry.run(key, JSON.stringify(payload), Date.now() + delayMs);
   setTimeout(() => runRetry(key).catch(e => log("retry failed:", e.message)), delayMs);
 }
 
+const retryDelay = attempt => Math.min(60 * 60_000, 60_000 * 2 ** Math.min(Math.max(attempt - 1, 0), 6));
+
 async function runRetry(key) {
   const pending = db.prepare("SELECT payload FROM retry_queue WHERE key=?").get(key);
   if (!pending) return;
-  db.prepare("DELETE FROM retry_queue WHERE key=?").run(key);
   const p = JSON.parse(pending.payload); // {chain, contract, tokenId, wallet, txHash, label, owner}
+  let info = null;
   try {
-    const info = await enrich(p.chain, p.contract, p.tokenId);
+    info = await enrich(p.chain, p.contract, p.tokenId);
     await notifyWithRetry(info, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner);
-    log("retry delivered full mint message", key);
-  } catch {
-    await notifyWithRetry({
+  } catch (e) {
+    info = null;
+    log("full retry alert unavailable; trying a reduced alert:", e.message);
+  }
+  if (!info) {
+    const reducedInfo = {
       name: shortAddr(p.contract), link: `https://opensea.io/assets/${p.chain}/${p.contract}`,
       maxSupply: null, minted: null, remaining: null, floor: null, bestOffer: null, imageUrl: null,
-    }, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner).catch(e => log("degraded send failed:", e.message));
-    log("retry delivered degraded mint message", key);
+    };
+    try {
+      await notifyWithRetry(reducedInfo, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner);
+    } catch (e) {
+      p.retryCount = (Number(p.retryCount) || 0) + 1;
+      const delayMs = retryDelay(p.retryCount);
+      scheduleRetry(key, p, delayMs);
+      log(`retry alert delivery failed; retry #${p.retryCount} in ${Math.round(delayMs / 1000)}s:`, e.message);
+      return;
+    }
   }
+  q.rmRetry.run(key);
+  log(info ? "retry delivered full mint message" : "retry delivered reduced mint message", key);
 }
 
 function flushRetries() {
@@ -518,7 +537,9 @@ async function processMint(chain, lg, parsed) {
       await notifyWithRetry(info, wallet, tokenId, lg.transactionHash, chain, label, owner);
       log(`alert sent: [${chain}] ${info.name} -> ${label ?? shortAddr(wallet)} (block ${lg.blockNumber})`);
     } catch (e) {
-      log("NOTIFY FAILED PERMANENTLY:", e.message);
+      const key = `${chain}:${lg.transactionHash}:${lg.index}:${owner}`;
+      log("NOTIFY FAILED; queueing a retry:", e.message);
+      scheduleRetry(key, { chain, contract, tokenId, wallet, txHash: lg.transactionHash, label, owner }, 60_000);
       tg("sendMessage", { chat_id: ownerChat(), text: `⚠️ Mint alert for <code>${contract}</code> (${chain}) failed to reach <code>${owner}</code>: ${esc(e.message)}`, parse_mode: "HTML" }).catch(() => {});
     }
   }
@@ -795,12 +816,36 @@ async function handleCommand(m) {
     }
     return doRemove(reply, arg, chatId);
   }
-  if (cmd === "/allow" && isPrivate && /^-?\d+$/.test(arg ?? "")) {
-    db.prepare("INSERT OR IGNORE INTO admins VALUES (?,?)").run(arg, Date.now());
-    await reply(`✅ Granted admin to <code>${arg}</code>`);
-  } else if (cmd === "/revoke" && isPrivate && /^-?\d+$/.test(arg ?? "")) {
-    db.prepare("DELETE FROM admins WHERE chat_id=?").run(arg);
-    await reply(`🗑 Revoked admin <code>${arg}</code>`);
+  if (["/allow", "/revoke", "/admins"].includes(cmd) && isPrivate && chatId !== String(C.TELEGRAM_CHAT_ID)) {
+    await reply("⛔ Only the bot owner can manage private-chat access.");
+  } else if (cmd === "/allow" && isPrivate && /^\d+$/.test(arg ?? "")) {
+    const grant = db.transaction(id => {
+      db.prepare("DELETE FROM revoked_admins WHERE chat_id=?").run(id);
+      db.prepare("INSERT OR IGNORE INTO admins VALUES (?,?)").run(id, Date.now());
+    });
+    grant(arg);
+    await reply(`✅ Granted private-chat access to <code>${arg}</code>`);
+  } else if (cmd === "/revoke" && isPrivate && /^\d+$/.test(arg ?? "")) {
+    if (arg === String(C.TELEGRAM_CHAT_ID)) {
+      await reply("The bot owner's access cannot be revoked.");
+      return;
+    }
+    const revoke = db.transaction(id => {
+      db.prepare("DELETE FROM admins WHERE chat_id=?").run(id);
+      db.prepare("INSERT INTO revoked_admins(chat_id,revoked_at) VALUES(?,?) " +
+        "ON CONFLICT(chat_id) DO UPDATE SET revoked_at=excluded.revoked_at").run(id, Date.now());
+    });
+    revoke(arg);
+    workspaceDbs.get(arg)?.prepare("DELETE FROM wallets").run();
+    for (const row of db.prepare("SELECT key,payload FROM retry_queue").all()) {
+      if (String(JSON.parse(row.payload).owner) === arg) q.rmRetry.run(row.key);
+    }
+    q.cacheDel.run(`pending:${arg}`);
+    await reply(`🗑 Revoked private-chat access for <code>${arg}</code>`);
+  } else if (cmd === "/admins" && isPrivate) {
+    await reply("🔐 Private chats with access:\n" + adminIds().map(id => `<code>${esc(id)}</code>`).join("\n"));
+  } else if (["/allow", "/revoke"].includes(cmd) && isPrivate) {
+    await reply(`Usage: <code>${cmd} &lt;private-chat-id&gt;</code>`);
   } else if (cmd === "/list") {
     await reply("👛 This chat's wallets:\n" + (workspaceWalletRows(chatId).map(r => `${r.label ? `<b>${esc(r.label)}</b> — ` : ""}<code>${r.address}</code>`).join("\n") || "(none)"));
   } else if (cmd === "/status") {
@@ -813,7 +858,7 @@ async function handleCommand(m) {
     await notify(SAMPLE_INFO, "0x000000000000000000000000000000000000dEaD", "42", null, CHAINS[0]?.chain ?? "ethereum", "Sample Wallet", chatId);
     await reply("✅ sample sent here");
   } else if (cmd === "/help") {
-    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name]); bulk: send a .txt/.csv file — one wallet per line, optional label\n/remove — untrack by address or label\n/list — this chat's wallets\n/status — health\n/test — sample alert to this chat\n/allow <id> — grant bot access (owner, private chat)\n/revoke <id> — remove access (owner, private chat)\n/cancel — abort a pending prompt\nIn groups and channels, admins manage that chat's own watchlist; alerts stay in that chat.");
+    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name]); bulk: send a .txt/.csv file — one wallet per line, optional label\n/remove — untrack by address or label\n/list — this chat's wallets\n/status — health\n/test — sample alert to this chat\n/allow <id> — grant private-chat access (owner only)\n/revoke <id> — revoke private-chat access (owner only)\n/admins — list private chats with access (owner only)\n/cancel — abort a pending prompt\nIn groups and channels, admins manage that chat's own watchlist; alerts stay in that chat.");
   }
 }
 
@@ -941,6 +986,13 @@ function selftest() {
   // maxOffer picks highest normalized bid
   const best = maxOffer([{ price: { value: "500000000000000000", decimals: 18, currency: "ETH" } }, { price: { value: "2000000000000000000", decimals: 18, currency: "ETH" } }]);
   assert.equal(best, "2 ETH");
+  assert.deepEqual(
+    privateAdminIds("owner", ["owner", "env-member"], ["db-member"], new Set(["env-member"])),
+    ["owner", "db-member"],
+  );
+  assert.equal(retryDelay(1), 60_000);
+  assert.equal(retryDelay(4), 8 * 60_000);
+  assert.equal(retryDelay(20), 60 * 60_000);
 
   // filter builder: 721 constrains topics[2], 1155 constrains topics[3] with wallets
   const fs = buildFilters([W1.toLowerCase()]);
@@ -965,6 +1017,7 @@ async function main() {
       { command: "help", description: "Show all commands" },
       { command: "allow", description: "Grant admin (owner only, private chat)" },
       { command: "revoke", description: "Remove admin (owner only, private chat)" },
+      { command: "admins", description: "List private chats with access (owner only)" },
       { command: "cancel", description: "Abort a pending prompt" },
     ],
     scope: { type: "all_private_chats" },
