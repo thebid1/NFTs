@@ -104,6 +104,13 @@ const privateAdminIds = (owner, configured, granted, revoked) =>
   [...new Set([String(owner), ...configured, ...granted])]
     .filter(id => id === String(owner) || !revoked.has(id));
 const adminIds = () => privateAdminIds(C.TELEGRAM_CHAT_ID, C.ADMIN_CHAT_IDS, dbAdmins(), revokedAdminIds());
+const knownPrivateIds = () => new Set([
+  String(C.TELEGRAM_CHAT_ID),
+  ...C.ADMIN_CHAT_IDS,
+  ...dbAdmins(),
+  ...revokedAdminIds(),
+  ...db.prepare("SELECT chat_id FROM workspaces WHERE chat_type='private'").all().map(r => r.chat_id),
+]);
 // Private chat used for owner-only notices.
 const ownerChat = () => C.TELEGRAM_CHAT_ID;
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -896,7 +903,7 @@ async function handleCommand(m) {
     }
     return doRemove(reply, arg, chatId);
   }
-  if (["/allow", "/revoke", "/admins"].includes(cmd) && isPrivate && chatId !== String(C.TELEGRAM_CHAT_ID)) {
+  if (["/allow", "/revoke", "/admins", "/users"].includes(cmd) && isPrivate && chatId !== String(C.TELEGRAM_CHAT_ID)) {
     await reply("⛔ Only the bot owner can manage private-chat access.");
   } else if (cmd === "/allow" && isPrivate && /^\d+$/.test(arg ?? "")) {
     const grant = db.transaction(id => {
@@ -908,6 +915,10 @@ async function handleCommand(m) {
   } else if (cmd === "/revoke" && isPrivate && /^\d+$/.test(arg ?? "")) {
     if (arg === String(C.TELEGRAM_CHAT_ID)) {
       await reply("The bot owner's access cannot be revoked.");
+      return;
+    }
+    if (!knownPrivateIds().has(arg)) {
+      await reply(`No private user found with id <code>${arg}</code>. Use /users to see known private user ids.`);
       return;
     }
     const revoke = db.transaction(id => {
@@ -924,6 +935,12 @@ async function handleCommand(m) {
     await reply(`🗑 Revoked private-chat access for <code>${arg}</code>`);
   } else if (cmd === "/admins" && isPrivate) {
     await reply("🔐 Private chats with access:\n" + adminIds().map(id => `<code>${esc(id)}</code>`).join("\n"));
+  } else if (cmd === "/users" && isPrivate) {
+    const ids = [...knownPrivateIds()].sort();
+    const active = new Set(adminIds());
+    await reply(`👥 Known private users (${ids.length}):\n` + ids.map(id =>
+      `<code>${esc(id)}</code>${active.has(id) ? " — access enabled" : " — revoked/inactive"}`
+    ).join("\n"));
   } else if (["/allow", "/revoke"].includes(cmd) && isPrivate) {
     await reply(`Usage: <code>${cmd} &lt;private-chat-id&gt;</code>`);
   } else if (cmd === "/list") {
@@ -938,7 +955,7 @@ async function handleCommand(m) {
     await notify(SAMPLE_INFO, "0x000000000000000000000000000000000000dEaD", "42", null, CHAINS[0]?.chain ?? "ethereum", "Sample Wallet", chatId);
     await reply("✅ sample sent here");
   } else if (cmd === "/help") {
-    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name]); bulk: send a .txt/.csv file — one wallet per line, optional label\n/remove — untrack by address or label\n/list — this chat's wallets\n/status — health\n/test — sample alert to this chat\n/allow <id> — grant private-chat access (owner only)\n/revoke <id> — revoke private-chat access (owner only)\n/admins — list private chats with access (owner only)\n/cancel — abort a pending prompt\nIn groups and channels, admins manage that chat's own watchlist; alerts stay in that chat.");
+    await reply("/add — track a wallet (send alone for step-by-step, or /add 0x… [name]); bulk: send a .txt/.csv file — one wallet per line, optional label\n/remove — untrack by address or label\n/list — this chat's wallets\n/status — health\n/test — sample alert to this chat\n/allow <id> — grant private-chat access (owner only)\n/revoke <id> — revoke private-chat access (owner only)\n/admins — list private chats with access (owner only)\n/users — list known private chat ids (owner only)\n/cancel — abort a pending prompt\nIn groups and channels, admins manage that chat's own watchlist; alerts stay in that chat.");
   }
 }
 
@@ -1103,6 +1120,7 @@ async function main() {
       { command: "allow", description: "Grant admin (owner only, private chat)" },
       { command: "revoke", description: "Remove admin (owner only, private chat)" },
       { command: "admins", description: "List private chats with access (owner only)" },
+      { command: "users", description: "List known private chat ids (owner only)" },
       { command: "cancel", description: "Abort a pending prompt" },
     ],
     scope: { type: "all_private_chats" },

@@ -138,7 +138,7 @@ Check health from your phone: Telegram `/status` (reports each chain's cursor).
 | Add a wallet | Telegram `/add 0x… [name]` or `/add name.eth [name]` — or send `/add` alone for a step-by-step prompt. **Bulk:** send a `.txt`/`.csv` file (one wallet per line, optional label — space or comma separated; `#` comments and a header row are ignored; max 1,000 rows). Applied to **all** chains, live resubscribe |
 | Remove | `/remove 0x…` or `/remove name` (also step-by-step if sent alone) |
 | List / health | `/list`, `/status` |
-| Grant/revoke private access | Owner only: `/admins`, `/allow <chat-id>`, `/revoke <chat-id>` |
+| Grant/revoke private access | Owner only: `/admins`, `/users` (known private IDs and access status), `/allow <chat-id>`, `/revoke <chat-id>`; `/revoke` reports unknown IDs |
 | Read recent logs cleanly | `pm2 logs nft-tracker --lines 100 --nostream --raw` |
 | Follow logs cleanly | `pm2 logs nft-tracker --lines 50 --raw` |
 | Restart after key/config change | edit `.env` or `chains.json`, then `pm2 restart nft-tracker --update-env` |
