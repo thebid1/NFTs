@@ -108,6 +108,14 @@ const adminIds = () => privateAdminIds(C.TELEGRAM_CHAT_ID, C.ADMIN_CHAT_IDS, dbA
 const ownerChat = () => C.TELEGRAM_CHAT_ID;
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const isRevokedRecipient = chatId => revokedAdminIds().has(String(chatId));
+
+class RevokedRecipientError extends Error {
+  constructor(chatId) {
+    super(`Telegram recipient ${chatId} has been revoked`);
+    this.name = "RevokedRecipientError";
+  }
+}
 
 // ---------- state ----------
 const db = new Database(path.join(__dirname, "tracker.db"));
@@ -235,6 +243,7 @@ const setCursorMax = (chain, b) => {
 const addrFromTopic = t => "0x" + t.slice(26).toLowerCase();
 const shortAddr = a => `${a.slice(0, 6)}…${a.slice(-4)}`;
 const esc = s => String(s).replace(/[&<>]/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[m]));
+const escAttr = s => esc(s).replace(/"/g, "&quot;");
 
 // Returns {wallet, contract, tokenId} if log is a mint into a tracked wallet, else null.
 function parseMintLog(log) {
@@ -266,12 +275,13 @@ function maxOffer(offers) {
 
 function render(i, wallet, tokenId, chain, label = null) {
   const who = label ? `${esc(label)} (${shortAddr(wallet)})` : shortAddr(wallet);
+  const link = String(i.link);
   return `🆕 <b>MINT DETECTED — ${esc(i.name)}</b> · ${esc(chain)}\n` +
-    `🔗 <a href="${i.link}">${i.link}</a>\n` +
-    `📦 Max supply: ${i.maxSupply ?? "open/unknown"}\n` +
-    `🧮 Collection minted: ${i.minted ?? "—"} · Remaining: ${i.remaining ?? "n/a"}\n` +
-    `💰 Floor: ${i.floor ?? "n/a"}\n` +
-    `🤝 Best offer: ${i.bestOffer ?? "n/a"}\n` +
+    `🔗 <a href="${escAttr(link)}">${esc(link)}</a>\n` +
+    `📦 Max supply: ${esc(i.maxSupply ?? "open/unknown")}\n` +
+    `🧮 Collection minted: ${esc(i.minted ?? "—")} · Remaining: ${esc(i.remaining ?? "n/a")}\n` +
+    `💰 Floor: ${esc(i.floor ?? "n/a")}\n` +
+    `🤝 Best offer: ${esc(i.bestOffer ?? "n/a")}\n` +
     `👛 ${who}${tokenId != null ? ` · Token #${esc(tokenId)}` : ""}`;
 }
 
@@ -287,13 +297,35 @@ function buildFilters(list = wallets()) {
 
 // ---------- telegram ----------
 const TG = `https://api.telegram.org/bot${C.TELEGRAM_BOT_TOKEN}`;
+class TelegramApiError extends Error {
+  constructor(method, status, errorCode, description) {
+    super(`tg ${method}: ${description || `HTTP ${status}`}`);
+    this.name = "TelegramApiError";
+    this.status = status;
+    this.errorCode = errorCode;
+  }
+}
+
+const isPermanentTelegramError = e =>
+  e instanceof TelegramApiError && [400, 403].includes(e.errorCode ?? e.status);
+
+const isRecipientTelegramError = e =>
+  e instanceof TelegramApiError &&
+  (e.errorCode === 403 || /chat not found|user is deactivated|bot was blocked|bot can't initiate/i.test(e.message));
+
 async function tg(method, body) {
   const r = await fetch(`${TG}/${method}`, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`tg ${method}: HTTP ${r.status}`);
-  const j = await r.json();
-  if (!j.ok) throw new Error(`tg ${method}: ${j.description}`);
+  let j;
+  try {
+    j = await r.json();
+  } catch (e) {
+    throw new Error(`tg ${method}: invalid JSON response (HTTP ${r.status}): ${e.message}`);
+  }
+  if (!r.ok || !j.ok) {
+    throw new TelegramApiError(method, r.status, j.error_code, j.description);
+  }
   return j;
 }
 
@@ -305,14 +337,19 @@ function replyMarkup(info, txHash, chain) {
 }
 
 async function notify(info, wallet, tokenId, txHash, chain, label = null, chatId = C.TELEGRAM_CHAT_ID) {
+  if (isRevokedRecipient(chatId)) throw new RevokedRecipientError(chatId);
   const text = render(info, wallet, tokenId, chain, label);
   const kb = replyMarkup(info, txHash, chain);
   if (info.imageUrl) {
     try {
       await tg("sendPhoto", { chat_id: chatId, photo: info.imageUrl, caption: text, parse_mode: "HTML", reply_markup: kb });
       return;
-    } catch (e) { log("sendPhoto failed, falling back to text:", e.message); }
+    } catch (e) {
+      if (isRecipientTelegramError(e)) throw e;
+      log("sendPhoto failed, falling back to text:", e.message);
+    }
   }
+  if (isRevokedRecipient(chatId)) throw new RevokedRecipientError(chatId);
   await tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: false, reply_markup: kb });
 }
 
@@ -320,7 +357,13 @@ async function notifyWithRetry(info, wallet, tokenId, txHash, chain, label = nul
   let last;
   for (const wait of [0, 2000, 8000]) {
     if (wait) await sleep(wait);
-    try { return await notify(info, wallet, tokenId, txHash, chain, label, chatId); } catch (e) { last = e; }
+    if (isRevokedRecipient(chatId)) throw new RevokedRecipientError(chatId);
+    try {
+      return await notify(info, wallet, tokenId, txHash, chain, label, chatId);
+    } catch (e) {
+      if (e instanceof RevokedRecipientError || isPermanentTelegramError(e)) throw e;
+      last = e;
+    }
   }
   throw last;
 }
@@ -454,6 +497,7 @@ async function enrich(chain, contract, tokenId) {
 
 // ---------- durable retry queue (enrichment and Telegram delivery) ----------
 function scheduleRetry(key, payload, delayMs) {
+  if (payload.owner != null && isRevokedRecipient(payload.owner)) return;
   q.addRetry.run(key, JSON.stringify(payload), Date.now() + delayMs);
   setTimeout(() => runRetry(key).catch(e => log("retry failed:", e.message)), delayMs);
 }
@@ -464,11 +508,26 @@ async function runRetry(key) {
   const pending = db.prepare("SELECT payload FROM retry_queue WHERE key=?").get(key);
   if (!pending) return;
   const p = JSON.parse(pending.payload); // {chain, contract, tokenId, wallet, txHash, label, owner}
+  if (isRevokedRecipient(p.owner)) {
+    q.rmRetry.run(key);
+    log("discarded retry for revoked recipient", p.owner);
+    return;
+  }
   let info = null;
   try {
     info = await enrich(p.chain, p.contract, p.tokenId);
     await notifyWithRetry(info, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner);
   } catch (e) {
+    if (e instanceof RevokedRecipientError || isRevokedRecipient(p.owner)) {
+      q.rmRetry.run(key);
+      log("discarded retry for revoked recipient", p.owner);
+      return;
+    }
+    if (isRecipientTelegramError(e)) {
+      q.rmRetry.run(key);
+      log("discarded retry after permanent Telegram error:", e.message);
+      return;
+    }
     info = null;
     log("full retry alert unavailable; trying a reduced alert:", e.message);
   }
@@ -480,6 +539,16 @@ async function runRetry(key) {
     try {
       await notifyWithRetry(reducedInfo, p.wallet, p.tokenId, p.txHash, p.chain, p.label, p.owner);
     } catch (e) {
+      if (e instanceof RevokedRecipientError || isRevokedRecipient(p.owner)) {
+        q.rmRetry.run(key);
+        log("discarded retry for revoked recipient", p.owner);
+        return;
+      }
+      if (isPermanentTelegramError(e)) {
+        q.rmRetry.run(key);
+        log("discarded retry after permanent Telegram error:", e.message);
+        return;
+      }
       p.retryCount = (Number(p.retryCount) || 0) + 1;
       const delayMs = retryDelay(p.retryCount);
       scheduleRetry(key, p, delayMs);
@@ -532,12 +601,23 @@ async function processMint(chain, lg, parsed) {
     return;
   }
   for (const owner of fresh) {
+    if (isRevokedRecipient(owner)) continue;
     const label = labelFor(wallet, owner);
     try {
       await notifyWithRetry(info, wallet, tokenId, lg.transactionHash, chain, label, owner);
       log(`alert sent: [${chain}] ${info.name} -> ${label ?? shortAddr(wallet)} (block ${lg.blockNumber})`);
     } catch (e) {
       const key = `${chain}:${lg.transactionHash}:${lg.index}:${owner}`;
+      if (e instanceof RevokedRecipientError || isRevokedRecipient(owner)) continue;
+      if (isRecipientTelegramError(e)) {
+        log("NOTIFY FAILED; recipient unavailable:", e.message);
+        continue;
+      }
+      if (isPermanentTelegramError(e)) {
+        log("NOTIFY FAILED; queueing one reduced-alert attempt:", e.message);
+        scheduleRetry(key, { chain, contract, tokenId, wallet, txHash: lg.transactionHash, label, owner }, 60_000);
+        continue;
+      }
       log("NOTIFY FAILED; queueing a retry:", e.message);
       scheduleRetry(key, { chain, contract, tokenId, wallet, txHash: lg.transactionHash, label, owner }, 60_000);
       tg("sendMessage", { chat_id: ownerChat(), text: `⚠️ Mint alert for <code>${contract}</code> (${chain}) failed to reach <code>${owner}</code>: ${esc(e.message)}`, parse_mode: "HTML" }).catch(() => {});
@@ -982,6 +1062,11 @@ function selftest() {
   assert(html.includes("MINT DETECTED")); assert(html.includes("&lt;script&gt;")); assert(html.includes("Remaining: 90"));
   assert(html.includes("· base")); assert(html.includes("Whale1 (0x1111…1111)"));
   assert(html.includes("Collection minted: 10")); assert(!html.includes("×3"));
+  const safeHtml = render({ name: "Collection", link: 'https://example.com/?a=1&b="two"', maxSupply: null, minted: null, remaining: null, floor: "<1 & ETH", bestOffer: null }, W1, null, "base");
+  assert(safeHtml.includes('href="https://example.com/?a=1&amp;b=&quot;two&quot;"'));
+  assert(safeHtml.includes("Floor: &lt;1 &amp; ETH"));
+  assert(isPermanentTelegramError(new TelegramApiError("sendMessage", 400, 400, "Bad Request")));
+  assert(!isPermanentTelegramError(new TelegramApiError("sendMessage", 429, 429, "Too Many Requests")));
 
   // maxOffer picks highest normalized bid
   const best = maxOffer([{ price: { value: "500000000000000000", decimals: 18, currency: "ETH" } }, { price: { value: "2000000000000000000", decimals: 18, currency: "ETH" } }]);

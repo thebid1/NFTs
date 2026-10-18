@@ -31,9 +31,10 @@ The bot is **multi-user**: everyone with access gets a private watchlist.
   messages the bot and you get a "🙋 Access request" note with their name and
   id — reply `/allow <id>` from the owner private chat and they're in, no
   restart. The owner can use `/admins` to list access and `/revoke <id>` to
-  revoke it. Revoking also removes that private chat's wallet list and pending
-  alert retries. Revocations override IDs in `ADMIN_CHAT_IDS`; `/allow <id>`
-  restores access. Unknown users get an invite-only notice.
+  revoke it. Revoking removes that private chat's wallet list and pending alert
+  retries, and prevents in-progress retries from sending again. Revocations
+  override IDs in `ADMIN_CHAT_IDS`; `/allow <id>` restores access. Unknown users
+  get an invite-only notice.
 - **Separate workspaces:** each private chat, group, supergroup, and channel
   has its own SQLite watchlist at `trackers/<chat-id>.db`. A group's or
   channel's wallets and labels are never stored in a user's watchlist database.
@@ -149,7 +150,10 @@ Telegram sends are tried immediately, after 2 seconds, and after 8 seconds.
 If enrichment or alert delivery still fails, the bot stores a retry in SQLite
 for 60 seconds later. A retry attempts the full alert, then a reduced alert;
 if Telegram cannot accept either, it keeps retrying with backoff up to once an
-hour. Pending retries survive bot restarts.
+hour. Telegram's permanent `400`/`403` errors are logged with Telegram's
+description and never enter the recurring retry schedule; a rejected full alert
+gets at most one reduced-alert attempt. Pending transient retries survive bot
+restarts.
 
 ## CLI modes
 

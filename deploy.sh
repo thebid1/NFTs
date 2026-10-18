@@ -55,3 +55,4 @@ pm2 save
 echo "==> done. logs: pm2 logs nft-tracker"
 echo "    clean snapshot: pm2 logs nft-tracker --lines 100 --nostream --raw"
 echo "    if this is the first deploy, run: pm2 startup   (then copy-paste the printed sudo command)"
+ 
