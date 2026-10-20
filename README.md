@@ -146,6 +146,11 @@ Check health from your phone: Telegram `/status` (reports each chain's cursor).
 | Backup | `tar czf tracker-backup.tgz -C ~ nft-tracker/bot.js nft-tracker/.env nft-tracker/chains.json nft-tracker/tracker.db nft-tracker/trackers` |
 
 `deploy.sh` configures PM2 log rotation (10 MB per file, 7 compressed files).
+WebSocket disconnects are retried with endpoint rotation and backoff; if a
+provider error prevents catch-up, the bot keeps the live subscription up and
+retries bounded backfill slices with backoff instead of letting the retry
+timer crash the process.
+Telegram polling also retries transient fetch failures after a short pause.
 Telegram sends are tried immediately, after 2 seconds, and after 8 seconds.
 If enrichment or alert delivery still fails, the bot stores a retry in SQLite
 for 60 seconds later. A retry attempts the full alert, then a reduced alert;

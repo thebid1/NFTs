@@ -655,25 +655,49 @@ function stopDetector(chain) {
   const d = detectors.get(chain);
   if (!d) return;
   d.stopped = true;
-  d.gen++;
   if (d.restartTimer) clearTimeout(d.restartTimer);
   if (d.watchdog) clearInterval(d.watchdog);
+  if (d.backfillTimer) clearTimeout(d.backfillTimer);
   try { d.provider?.destroy(); } catch { /* already closed */ }
   detectors.delete(chain);
 }
 
-const reconnectFails = new Map(); // chain -> consecutive failed connects; reset on a stable resubscribe
-function scheduleReconnect(chain, gen) {
+const reconnectFails = new Map(); // chain -> consecutive failed reconnects; reset after websocket connection
+function scheduleReconnect(chain, expected) {
   const d = detectors.get(chain);
-  if (!d || d.stopped || d.gen !== gen || d.restartTimer) return;
+  if (!d || d !== expected || d.stopped || d.restartTimer) return;
   const n = (reconnectFails.get(chain) ?? 0) + 1;
   reconnectFails.set(chain, n);
   wssCursor.set(chain, (wssCursor.get(chain) ?? 0) + 1);
   const delay = Math.min(60_000, 5_000 * 2 ** (n - 1)); // 5s → 10s → 20s → 40s → 60s cap
+  log(`[${chain}] reconnecting in ${Math.ceil(delay / 1000)}s`);
   d.restartTimer = setTimeout(async () => {
     d.restartTimer = null;
-    try { await backfill(chain); } catch (e) { log(`[${chain}] pre-reconnect backfill failed:`, e.message); }
-    await startDetector(chain);
+    try {
+      await startDetector(chain);
+    } catch (e) {
+      log(`[${chain}] reconnect failed:`, e.message);
+      const current = detectors.get(chain);
+      if (current) scheduleReconnect(chain, current);
+    }
+  }, delay);
+}
+
+function scheduleBackfill(chain, d, delay) {
+  if (detectors.get(chain) !== d || d.stopped || d.backfillTimer) return;
+  d.backfillTimer = setTimeout(async () => {
+    d.backfillTimer = null;
+    if (detectors.get(chain) !== d || d.stopped) return;
+    try {
+      const more = await backfill(chain);
+      d.backfillFailures = 0;
+      if (more) scheduleBackfill(chain, d, 1000);
+    } catch (e) {
+      d.backfillFailures++;
+      const retryDelay = Math.min(60_000, 5_000 * 2 ** (d.backfillFailures - 1));
+      log(`[${chain}] backfill retry failed; retrying in ${Math.ceil(retryDelay / 1000)}s:`, e.message);
+      scheduleBackfill(chain, d, retryDelay);
+    }
   }, delay);
 }
 
@@ -681,9 +705,8 @@ async function startDetector(chain) {
   stopDetector(chain);
   const cfg = chainCfg(chain);
   if (!cfg) { log(`[${chain}] no config entry; skipping`); return; }
-  const d = { provider: null, stopped: false, gen: 1, restartTimer: null, watchdog: null };
+  const d = { provider: null, stopped: false, restartTimer: null, watchdog: null, backfillTimer: null, backfillFailures: 0 };
   detectors.set(chain, d);
-  const gen = d.gen;
   const filters = buildFilters();
   if (!filters.length) { log("no tracked wallets; detectors idle — use /add to start tracking"); return; }
 
@@ -692,7 +715,7 @@ async function startDetector(chain) {
   const wssUrl = wssUrls[(wssCursor.get(chain) ?? 0) % wssUrls.length];
   const wss = new ethers.WebSocketProvider(wssUrl);
   d.provider = wss;
-  const onWsDown = why => { log(`[${chain}] websocket down (${why}); reconnecting in 5s`); scheduleReconnect(chain, gen); };
+  const onWsDown = why => { log(`[${chain}] websocket down (${why})`); scheduleReconnect(chain, d); };
   wss.on("error", e => onWsDown(e?.message ?? "error"));
   try {
     const ws = wss.websocket;
@@ -702,7 +725,7 @@ async function startDetector(chain) {
 
   try {
     await wss.getBlockNumber(); // force connection
-  } catch (e) { log(`[${chain}] websocket connect failed:`, e.message); scheduleReconnect(chain, gen); return; }
+  } catch (e) { log(`[${chain}] websocket connect failed:`, e.message); scheduleReconnect(chain, d); return; }
 
   for (const f of filters) wss.on({ topics: f.topics }, entry => enqueue(() => handleLog(chain, entry)));
   reconnectFails.set(chain, 0);
@@ -714,7 +737,12 @@ async function startDetector(chain) {
     wss.send("net_version", []).catch(() => onWsDown("watchdog"));
   }, 60_000);
 
-  await backfill(chain); // cold start / gap catch-up from persisted cursor
+  try {
+    if (await backfill(chain)) scheduleBackfill(chain, d, 1000); // drain capped slices while behind
+  } catch (e) {
+    log(`[${chain}] backfill failed; keeping websocket live:`, e.message);
+    scheduleBackfill(chain, d, 5000);
+  }
 }
 
 async function backfill(chain) {
@@ -726,9 +754,10 @@ async function backfill(chain) {
   const lookback = Number(cfg.lookback) > 0 ? Number(cfg.lookback) : C.LOOKBACK_BLOCKS;
   const maxBackfill = Number(cfg.maxBackfill) > 0 ? Number(cfg.maxBackfill) : C.MAX_BACKFILL_BLOCKS;
   const head = await provider.getBlockNumber();
-  let to = head - C.CONFIRMATIONS + 1;
+  const target = head - C.CONFIRMATIONS + 1;
+  let to = target;
   const from = Math.max(getCursor(chain) != null ? getCursor(chain) + 1 : to - lookback + 1, 0);
-  if (from > to) return;
+  if (from > to) return false;
   if (to - from + 1 > maxBackfill) { // cap CU spend per run; the cursor advances progressively on later runs
     log(`[${chain}] gap ${to - from + 1} blocks > maxBackfill=${maxBackfill}; slicing ${from}..${from + maxBackfill - 1} this run`);
     to = from + maxBackfill - 1;
@@ -743,6 +772,7 @@ async function backfill(chain) {
     setCursorMax(chain, e);
   }
   log(`[${chain}] backfill done, cursor at`, getCursor(chain));
+  return to < target;
 }
 
 async function restartAllDetectors() {
