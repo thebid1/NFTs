@@ -751,9 +751,25 @@ async function backfill(chain) {
   const filters = buildFilters();
   if (!filters.length) return;
   const provider = httpFor(chain);
+  const withRateLimitRetry = async (operation, label) => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await operation();
+      } catch (e) {
+        const details = [e?.message, e?.shortMessage, e?.error?.message, e?.info?.error?.message]
+          .filter(Boolean).join(" ");
+        const rateLimited = e?.error?.code === 429 || e?.info?.error?.code === 429 ||
+          /\b429\b|rate limit|compute units per second capacity|too many requests/i.test(details);
+        if (!rateLimited || attempt >= 3) throw e;
+        const delay = Math.min(30_000, 2_000 * 2 ** attempt);
+        log(`[${chain}] RPC rate limited during ${label}; retrying in ${Math.ceil(delay / 1000)}s (attempt ${attempt + 2}/4)`);
+        await sleep(delay);
+      }
+    }
+  };
   const lookback = Number(cfg.lookback) > 0 ? Number(cfg.lookback) : C.LOOKBACK_BLOCKS;
   const maxBackfill = Number(cfg.maxBackfill) > 0 ? Number(cfg.maxBackfill) : C.MAX_BACKFILL_BLOCKS;
-  const head = await provider.getBlockNumber();
+  const head = await withRateLimitRetry(() => provider.getBlockNumber(), "eth_blockNumber");
   const target = head - C.CONFIRMATIONS + 1;
   let to = target;
   const from = Math.max(getCursor(chain) != null ? getCursor(chain) + 1 : to - lookback + 1, 0);
@@ -766,7 +782,10 @@ async function backfill(chain) {
   for (let s = from; s <= to; s += CHUNK) {
     const e = Math.min(s + CHUNK - 1, to);
     for (const f of filters) {
-      const logs = await provider.getLogs({ topics: f.topics, fromBlock: s, toBlock: e });
+      const logs = await withRateLimitRetry(
+        () => provider.getLogs({ topics: f.topics, fromBlock: s, toBlock: e }),
+        `eth_getLogs ${s}..${e}`,
+      );
       for (const entry of logs) await handleLog(chain, entry);
     }
     setCursorMax(chain, e);
